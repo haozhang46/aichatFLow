@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: Unified FastGPT-Dify API
+  version: 0.1.0
+  description: Contract for plan-first unified chat/workflow access and stream execution.
+servers:
+  - url: https://api.example.com
+paths:
+  /v1/unified/plan:
+    post:
+      summary: Generate editable plan and capability recommendations for chat
+      operationId: planUnifiedRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnifiedRequest'
+      responses:
+        '200':
+          description: Plan response with recommendation metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnifiedResponse'
+        '400':
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/unified/execute:
+    post:
+      summary: Execute a unified chat or workflow request
+      operationId: executeUnifiedRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnifiedRequest'
+      responses:
+        '200':
+          description: Unified response envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnifiedResponse'
+        '400':
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/unified/execute/stream:
+    post:
+      summary: Execute a confirmed chat plan and stream execution events
+      operationId: executeUnifiedStream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnifiedRequest'
+      responses:
+        '200':
+          description: SSE stream of execution events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid request or missing confirmation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Upstream provider error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/routes:
+    get:
+      summary: List integration routes
+      operationId: listRoutes
+      responses:
+        '200':
+          description: Active route list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IntegrationRoute'
+components:
+  schemas:
+    UnifiedRequest:
+      type: object
+      required:
+        - requestId
+        - tenantId
+        - requestType
+      properties:
+        requestId:
+          type: string
+        tenantId:
+          type: string
+        requestType:
+          type: string
+          enum: [chat, workflow]
+        messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        workflowId:
+          type: string
+        inputs:
+          type: object
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+    UnifiedResponse:
+      type: object
+      required:
+        - requestId
+        - provider
+        - status
+        - latencyMs
+        - traceId
+        - fallbackUsed
+        - timestamp
+      properties:
+        requestId:
+          type: string
+        provider:
+          type: string
+          enum: [fastgpt, dify]
+        status:
+          type: string
+          enum: [success, partial, failed]
+        output:
+          type: object
+          additionalProperties: true
+          properties:
+            mode:
+              type: string
+              enum: [agent, react, workflow]
+            phase:
+              type: string
+              enum: [plan, execute]
+            plan:
+              type: array
+              items:
+                type: string
+            recommendedAgent:
+              type: string
+            recommendedSkills:
+              type: array
+              items:
+                type: string
+            missingSkills:
+              type: array
+              items:
+                type: string
+            installRequired:
+              type: boolean
+        error:
+          type: object
+          additionalProperties: true
+        latencyMs:
+          type: number
+        traceId:
+          type: string
+        fallbackUsed:
+          type: boolean
+        timestamp:
+          type: string
+          format: date-time
+    IntegrationRoute:
+      type: object
+      required:
+        - id
+        - tenantId
+        - requestType
+        - primaryProvider
+        - fallbackProvider
+        - timeoutMs
+        - enabled
+      properties:
+        id:
+          type: string
+        tenantId:
+          type: string
+        requestType:
+          type: string
+          enum: [chat, workflow]
+        matchTags:
+          type: array
+          items:
+            type: string
+        primaryProvider:
+          type: string
+          enum: [fastgpt, dify]
+        fallbackProvider:
+          type: string
+          enum: [fastgpt, dify, none]
+        timeoutMs:
+          type: integer
+          minimum: 1000
+          maximum: 15000
+        enabled:
+          type: boolean
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string

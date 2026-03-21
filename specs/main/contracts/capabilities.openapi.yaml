@@ -1,0 +1,71 @@
+openapi: 3.1.0
+info:
+  title: Capability Discovery API
+  version: 0.1.0
+  description: Lists available agents and skills for plan recommendation and guarded installation.
+servers:
+  - url: https://api.example.com
+paths:
+  /v1/capabilities:
+    get:
+      summary: List agent and skill capabilities
+      operationId: listCapabilities
+      responses:
+        '200':
+          description: Capability catalog
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityResponse'
+components:
+  schemas:
+    CapabilityResponse:
+      type: object
+      required: [agents, skills]
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentCapability'
+        skills:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillCapability'
+    AgentCapability:
+      type: object
+      required: [id, label, available]
+      properties:
+        id:
+          type: string
+          enum: [agent, react, workflow]
+        label:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+        available:
+          type: boolean
+    SkillCapability:
+      type: object
+      required: [id, name, source, installed, trusted]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        source:
+          type: string
+          enum: [local, curated, github]
+        installed:
+          type: boolean
+        trusted:
+          type: boolean
+        version:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        installCommand:
+          type: string

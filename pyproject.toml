@@ -1,0 +1,26 @@
+[project]
+name = "aichatflow"
+version = "0.1.0"
+description = "FastGPT + Dify unified gateway with FastAPI"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.116.1",
+  "uvicorn>=0.35.0",
+  "httpx>=0.28.1",
+  "pydantic-settings>=2.11.0",
+  "langchain>=0.2.16",
+  "langchain-openai>=0.1.23",
+  "langgraph>=0.2.20",
+  "jsonschema>=4.22.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.2.0"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests_py"]

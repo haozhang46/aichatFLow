@@ -1,0 +1,39 @@
+---
+description: Project Development Guidelines
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# aiChatFLow Development Guidelines
+
+Auto-generated from all feature plans. Last updated: 2026-03-20
+
+## Active Technologies
+- Python 3.9 (backend), TypeScript 5.x + React 19 + Next.js 16 (frontend) + FastAPI, Pydantic, LangChain/LangGraph, Next.js, TailwindCSS (main)
+- In-memory for MVP (plan history in UI state), optional file-based cache for local skill catalog snapsho (main)
+
+- TypeScript 5.x on Node.js 20 LTS + Fastify (HTTP API), Zod (schema validation), Axios (provider HTTP client), Pino (logging) (main)
+
+## Project Structure
+
+```text
+backend/
+frontend/
+tests/
+```
+
+## Commands
+
+npm test && npm run lint
+
+## Code Style
+
+TypeScript 5.x on Node.js 20 LTS: Follow standard conventions
+
+## Recent Changes
+- main: Added Python 3.9 (backend), TypeScript 5.x + React 19 + Next.js 16 (frontend) + FastAPI, Pydantic, LangChain/LangGraph, Next.js, TailwindCSS
+
+- main: Added TypeScript 5.x on Node.js 20 LTS + Fastify (HTTP API), Zod (schema validation), Axios (provider HTTP client), Pino (logging)
+
+<!-- MANUAL ADDITIONS START -->
+<!-- MANUAL ADDITIONS END -->
