@@ -2,7 +2,7 @@
 
 import AppButton from "@/components/ui/AppButton";
 import AppModal from "@/components/ui/AppModal";
-import type { CapabilityAgent, CapabilitySkill } from "@/app/components/modalTypes";
+import type { CapabilityAgent, CapabilitySkill, CapabilityTool } from "@/app/components/modalTypes";
 
 type Props = {
   open: boolean;
@@ -14,8 +14,10 @@ type Props = {
   loadCapabilities: (keyword?: string, page?: number) => Promise<void>;
   capabilityAgents: CapabilityAgent[];
   capabilitySkills: CapabilitySkill[];
+  capabilityTools: CapabilityTool[];
   installSkill: (skillId: string) => Promise<void>;
   toggleWhitelist: (skillId: string, enabled: boolean) => Promise<void>;
+  toggleToolPolicy: (toolId: string, field: "allowlisted" | "denylisted", enabled: boolean) => Promise<void>;
   capabilityPage: number;
   capabilitySkillsTotal: number;
   capabilityPageSize: number;
@@ -86,7 +88,7 @@ export default function CapabilityModal(props: Props) {
         </AppButton>
       </div>
       {props.capabilityTab === "existing" ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 overflow-auto">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 overflow-auto">
           <div>
             <div className="text-sm font-medium mb-2">Agents</div>
             <div className="space-y-2">
@@ -96,6 +98,42 @@ export default function CapabilityModal(props: Props) {
                   <div className="text-xs text-zinc-500">{a.description}</div>
                 </div>
               ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-sm font-medium mb-2">Tools</div>
+            <div className="space-y-2">
+              {props.capabilityTools.map((tool) => (
+                <div key={tool.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2">
+                  <div className="text-sm font-medium">{tool.name}</div>
+                  <div className="text-xs text-zinc-500">{tool.id}</div>
+                  <div className="text-xs text-zinc-500 mt-1">{tool.description || "No description"}</div>
+                  <div className="text-xs text-zinc-500 mt-1">
+                    {tool.category || "general"} | {tool.builtin ? "builtin" : "external"}
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <label className="text-xs flex items-center gap-1">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(tool.allowlisted)}
+                        onChange={(e) => void props.toggleToolPolicy(tool.id, "allowlisted", e.target.checked)}
+                      />
+                      allowlist
+                    </label>
+                    <label className="text-xs flex items-center gap-1">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(tool.denylisted)}
+                        onChange={(e) => void props.toggleToolPolicy(tool.id, "denylisted", e.target.checked)}
+                      />
+                      denylist
+                    </label>
+                  </div>
+                </div>
+              ))}
+              {props.capabilityTools.length === 0 ? (
+                <div className="text-xs text-zinc-500">暂无 tools。</div>
+              ) : null}
             </div>
           </div>
           <div>

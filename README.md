@@ -2,6 +2,11 @@
 
 FastAPI 网关（统一 plan / execute、能力发现等）。**必须用安装了依赖的 Python 环境启动**，否则会报 `ModuleNotFoundError: No module named 'langchain_openai'`。
 
+当前提供两条运行时路径：
+
+- ` /v1/unified/* `: 兼容旧的统一入口；其中 `/v1/unified/execute/stream` 已复用 OTIE 运行时执行结构化计划。
+- ` /v1/otie/* `: 新的 OTIE schema-first 入口，包含 `intent`、`plan`、`run`、`runs/{id}`。
+
 ## 后端（推荐）
 
 在项目根目录：

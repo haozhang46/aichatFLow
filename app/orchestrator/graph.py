@@ -5,10 +5,17 @@ import os
 import time
 from typing import Any, AsyncGenerator, Dict, Literal, Optional, TypedDict, Union
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import END, StateGraph
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage
+    from langchain_core.prompts import ChatPromptTemplate
+    from langgraph.graph import END, StateGraph
+except ImportError:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore[assignment]
+    SystemMessage = None  # type: ignore[assignment]
+    ChatPromptTemplate = None  # type: ignore[assignment]
+    END = None  # type: ignore[assignment]
+    StateGraph = None  # type: ignore[assignment]
 
 from app.core.config import settings
 
@@ -25,6 +32,8 @@ class GraphState(TypedDict):
 
 def _offline_mode(llm_config: Optional[Dict[str, str]] = None) -> bool:
     # In tests you typically don't have OPENAI_API_KEY, so fall back to deterministic mode selection.
+    if ChatOpenAI is None or ChatPromptTemplate is None or SystemMessage is None or StateGraph is None:
+        return True
     if os.environ.get("NODE_ENV") == "test":
         return True
     if llm_config and llm_config.get("apiKey"):
@@ -68,6 +77,18 @@ def build_orchestrator_graph(llm_config: Optional[Dict[str, str]] = None):
         def workflow_node(state: GraphState) -> GraphState:
             state["answer"] = f"[workflow] 1) 解析需求 2) 拟定步骤 3) 输出答案：{state['query']}"
             return state
+
+        if StateGraph is None or END is None:
+            class OfflineOrchestrator:
+                async def ainvoke(self, state: GraphState) -> GraphState:
+                    state = router(state)
+                    if state["mode"] == "react":
+                        return react_node(state)
+                    if state["mode"] == "workflow":
+                        return workflow_node(state)
+                    return agent_node(state)
+
+            return OfflineOrchestrator()
 
     else:
         api_key = (llm_config or {}).get("apiKey") or settings.openai_api_key
@@ -418,4 +439,3 @@ async def run_orchestrator_stream_for_step(
     strat: Strategy = strategy if strategy in ("auto", "agent", "react", "workflow") else "auto"
     async for evt in run_orchestrator_stream(composed, strategy=strat, llm_config=llm_config):
         yield evt
-

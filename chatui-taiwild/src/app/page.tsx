@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactElement } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import {
   type Edge,
   type Node,
@@ -16,6 +16,9 @@ import CapabilityModal from "@/app/components/CapabilityModal";
 import DeepseekModal from "@/app/components/DeepseekModal";
 import PlanRecordModal from "@/app/components/PlanRecordModal";
 import PlanDetailModal from "@/app/components/PlanDetailModal";
+import RagViewerModal from "@/app/components/RagViewerModal";
+import SettingsModal from "@/app/components/SettingsModal";
+import TraceModal from "@/app/components/TraceModal";
 import type {
   Strategy,
   PlanHistoryItem,
@@ -23,6 +26,7 @@ import type {
   ExecutionPlan,
   ExecutionPlanStep,
   ClawhubPlanSuggestion,
+  RagConfig,
 } from "@/app/components/modalTypes";
 
 type ChatRole = "user" | "assistant";
@@ -30,6 +34,7 @@ type ChatRole = "user" | "assistant";
 type ChatMessage = {
   role: ChatRole;
   content: string;
+  traceId?: string;
 };
 
 type ExecutionMode = "auto_exec" | "user_exec";
@@ -38,6 +43,8 @@ type PendingPlan = {
   requestId: string;
   query: string;
   mode: Strategy;
+  reusedFromPlanRecord?: boolean;
+  planRecordPath?: string;
   intentDescription: string;
   thinking: string;
   searchEvidence: Array<{ title: string; url: string }>;
@@ -75,6 +82,16 @@ type CapabilitySkill = {
   };
 };
 
+type CapabilityTool = {
+  id: string;
+  name: string;
+  description: string;
+  category?: string;
+  builtin?: boolean;
+  allowlisted?: boolean;
+  denylisted?: boolean;
+};
+
 type FlowSource = {
   title: string;
   mode: Strategy;
@@ -90,6 +107,7 @@ type FolderAuthorization = {
 type StepExecutionConfig = {
   agent: string;
   skills: string[];
+  tools: string[];
 };
 
 type ExecutionChecklistItem = {
@@ -105,6 +123,22 @@ type DeepSeekConfig = {
   apiKey: string;
   baseUrl: string;
   model: string;
+};
+
+type RagDocument = {
+  documentId: string;
+  scope: string;
+  title: string;
+  source?: string;
+  tags?: string[];
+  content?: string;
+  chunks?: Array<{ chunkId: string; chunkIndex: number; content: string }>;
+  updatedAt?: string;
+};
+
+type RagGraph = {
+  nodes: Array<{ id: string; type: string; label: string; meta: Record<string, unknown> }>;
+  edges: Array<{ id: string; source: string; target: string }>;
 };
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:3000";
@@ -199,6 +233,8 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  const [canResumeChatAction, setCanResumeChatAction] = useState(false);
+  const [resumeChatActionLabel, setResumeChatActionLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
   const [planSupplement, setPlanSupplement] = useState("");
@@ -228,6 +264,7 @@ export default function Home() {
   const [capabilityQuery, setCapabilityQuery] = useState("");
   const [capabilityAgents, setCapabilityAgents] = useState<CapabilityAgent[]>([]);
   const [capabilitySkills, setCapabilitySkills] = useState<CapabilitySkill[]>([]);
+  const [capabilityTools, setCapabilityTools] = useState<CapabilityTool[]>([]);
   const [capabilityWhitelist, setCapabilityWhitelist] = useState<string[]>([]);
   const [personalSkillRootPath, setPersonalSkillRootPath] = useState("");
   const [personalSkillPathInput, setPersonalSkillPathInput] = useState("");
@@ -254,15 +291,71 @@ export default function Home() {
   const [planRecordOpen, setPlanRecordOpen] = useState(false);
   const [planRecordSearch, setPlanRecordSearch] = useState("");
   const [selectedPlanRecord, setSelectedPlanRecord] = useState<PlanHistoryItem | null>(null);
+  const [traceOpen, setTraceOpen] = useState(false);
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceError, setTraceError] = useState<string | null>(null);
+  const [traceViewerId, setTraceViewerId] = useState<string | null>(null);
+  const [traceViewerIds, setTraceViewerIds] = useState<string[]>([]);
+  const [traceViewerRun, setTraceViewerRun] = useState<Record<string, unknown> | null>(null);
   const [deepseekOpen, setDeepseekOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [ragOpen, setRagOpen] = useState(false);
+  const [ragLoading, setRagLoading] = useState(false);
+  const [ragError, setRagError] = useState<string | null>(null);
+  const [ragScopes, setRagScopes] = useState<string[]>([]);
+  const [ragDocuments, setRagDocuments] = useState<RagDocument[]>([]);
+  const [ragGraph, setRagGraph] = useState<RagGraph | null>(null);
+  const [ragSelectedScope, setRagSelectedScope] = useState("");
+  const [ragConfig, setRagConfig] = useState<RagConfig>({
+    enabled: false,
+    scope: "",
+    topK: 5,
+  });
   const [deepseekConfig, setDeepseekConfig] = useState<DeepSeekConfig>({
     enabled: false,
     apiKey: "",
     baseUrl: "https://api.deepseek.com/v1",
     model: "deepseek-chat",
   });
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+  const resumableChatActionRef = useRef<null | (() => Promise<void>)>(null);
+
+  function beginChatAction(label: string, resumeAction: () => Promise<void>) {
+    chatAbortControllerRef.current?.abort();
+    chatAbortControllerRef.current = new AbortController();
+    resumableChatActionRef.current = resumeAction;
+    setCanResumeChatAction(false);
+    setResumeChatActionLabel(label);
+    return chatAbortControllerRef.current;
+  }
+
+  function finishChatAction() {
+    chatAbortControllerRef.current = null;
+  }
+
+  function stopChatAction() {
+    if (!chatAbortControllerRef.current) return;
+    chatAbortControllerRef.current.abort();
+    chatAbortControllerRef.current = null;
+    setCanResumeChatAction(true);
+    setMessages((prev) => [...prev, { role: "assistant", content: "当前请求已停止。可点击 Resume 重新发起。" }]);
+  }
+
+  async function resumeChatAction() {
+    if (!resumableChatActionRef.current || loading) return;
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: `恢复动作：${resumeChatActionLabel ?? "上一次请求"}（将重新开始）` },
+    ]);
+    await resumableChatActionRef.current();
+  }
 
   function newChat() {
+    chatAbortControllerRef.current?.abort();
+    chatAbortControllerRef.current = null;
+    resumableChatActionRef.current = null;
+    setCanResumeChatAction(false);
+    setResumeChatActionLabel(null);
     setMessages([]);
     setPendingPlan(null);
     setPlanSupplement("");
@@ -300,6 +393,7 @@ export default function Home() {
               recommendedSkills: Array.isArray(item.recommendedSkills) ? item.recommendedSkills : [],
               supplement: item.supplement ?? "",
               savedPath: item.savedPath,
+              lastTraceId: typeof item.lastTraceId === "string" ? item.lastTraceId : undefined,
               favorite: Boolean(item.favorite),
               createdAt: item.createdAt ?? new Date().toISOString(),
               executionMode:
@@ -407,9 +501,85 @@ export default function Home() {
     if (!res.ok) throw new Error(data?.detail ?? "load capabilities failed");
     setCapabilityAgents(Array.isArray(data?.agents) ? data.agents : []);
     setCapabilitySkills(Array.isArray(data?.skills) ? data.skills : []);
+    setCapabilityTools(Array.isArray(data?.tools) ? data.tools : []);
     setCapabilityWhitelist(Array.isArray(data?.whitelist) ? data.whitelist.map((x: unknown) => String(x)) : []);
     setCapabilitySkillsTotal(Number(data?.skillsTotal ?? 0));
     setCapabilityPage(Number(data?.page ?? page));
+  }
+
+  function buildRagInput() {
+    const scope = ragConfig.scope.trim();
+    if (!ragConfig.enabled && !scope) return null;
+    return {
+      enabled: ragConfig.enabled || scope.length > 0,
+      scope,
+      topK: ragConfig.topK,
+    };
+  }
+
+  async function loadRagViewer(scope = ragSelectedScope) {
+    setRagLoading(true);
+    setRagError(null);
+    try {
+      const scopeQuery = scope.trim();
+      const [scopesRes, docsRes, graphRes] = await Promise.all([
+        fetch(`${apiBaseUrl}/v1/rag/scopes?tenantId=${encodeURIComponent(tenantId)}`),
+        fetch(
+          `${apiBaseUrl}/v1/rag/documents?tenantId=${encodeURIComponent(tenantId)}${
+            scopeQuery ? `&scope=${encodeURIComponent(scopeQuery)}` : ""
+          }`
+        ),
+        fetch(
+          `${apiBaseUrl}/v1/rag/graph?tenantId=${encodeURIComponent(tenantId)}${
+            scopeQuery ? `&scope=${encodeURIComponent(scopeQuery)}` : ""
+          }`
+        ),
+      ]);
+      const scopesData = await scopesRes.json().catch(() => ({}));
+      const docsData = await docsRes.json().catch(() => ({}));
+      const graphData = await graphRes.json().catch(() => ({}));
+      if (!scopesRes.ok) throw new Error(scopesData?.detail ?? "load rag scopes failed");
+      if (!docsRes.ok) throw new Error(docsData?.detail ?? "load rag documents failed");
+      if (!graphRes.ok) throw new Error(graphData?.detail ?? "load rag graph failed");
+      setRagScopes(Array.isArray(scopesData?.items) ? scopesData.items.map((x: unknown) => String(x)) : []);
+      setRagDocuments(Array.isArray(docsData?.items) ? (docsData.items as RagDocument[]) : []);
+      setRagGraph((graphData?.graph as RagGraph) ?? { nodes: [], edges: [] });
+    } catch (e: unknown) {
+      setRagError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRagLoading(false);
+    }
+  }
+
+  async function addRagDocument(payload: {
+    scope: string;
+    title: string;
+    content: string;
+    source: string;
+    tags: string[];
+  }) {
+    setRagError(null);
+    const res = await fetch(`${apiBaseUrl}/v1/rag/documents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenantId,
+        scope: payload.scope,
+        title: payload.title,
+        content: payload.content,
+        source: payload.source,
+        tags: payload.tags,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = data?.detail ?? "add rag document failed";
+      setRagError(message);
+      throw new Error(message);
+    }
+    const nextScope = payload.scope.trim();
+    setRagSelectedScope(nextScope);
+    await loadRagViewer(nextScope);
   }
 
   async function loadCustomAgents() {
@@ -506,6 +676,24 @@ export default function Home() {
     await loadCapabilities(capabilityQuery, capabilityPage);
   }
 
+  async function toggleToolPolicy(
+    toolId: string,
+    field: "allowlisted" | "denylisted",
+    enabled: boolean
+  ) {
+    const res = await fetch(`${apiBaseUrl}/v1/capabilities/tools/policy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ toolId, [field]: enabled }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "set tool policy failed");
+      return;
+    }
+    await loadCapabilities(capabilityQuery, capabilityPage);
+  }
+
   async function searchOnlineSkills() {
     const res = await fetch(`${apiBaseUrl}/v1/clawhub/search?q=${encodeURIComponent(onlineQuery)}&limit=25`);
     const data = await res.json();
@@ -586,20 +774,24 @@ export default function Home() {
     }
   }
 
-  async function sendMessage() {
-    const content = input.trim();
-    setInput("");
+  async function sendMessageWithContent(content: string, options?: { appendUserMessage?: boolean }) {
+    const appendUserMessage = options?.appendUserMessage ?? true;
+    if (!content.trim()) return;
     setError(null);
-
-    const userMsg: ChatMessage = { role: "user", content };
-    setMessages((prev) => [...prev, userMsg]);
+    if (appendUserMessage) {
+      const userMsg: ChatMessage = { role: "user", content };
+      setMessages((prev) => [...prev, userMsg]);
+    }
     setLoading(true);
+    const controller = beginChatAction("chat", () => sendMessageWithContent(content, { appendUserMessage: false }));
 
     try {
       const requestId = newRequestId();
+      const rag = buildRagInput();
       const res = await fetch(`${apiBaseUrl}/v1/unified/plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           requestId,
           tenantId,
@@ -607,6 +799,7 @@ export default function Home() {
           messages: [{ role: "user", content }],
           inputs: {
             strategy,
+            ...(rag ? { rag } : {}),
             llmConfig:
               deepseekConfig.enabled && deepseekConfig.apiKey.trim()
                 ? {
@@ -656,10 +849,17 @@ export default function Home() {
         : [];
       const clawhubSuggestions = normalizeClawhubSuggestions(data?.output?.clawhubPlanSuggestions);
       const executionPlan = normalizeExecutionPlan(data?.output?.executionPlan, lines, mode);
+      const reusedFromPlanRecord = Boolean(data?.output?.reusedFromPlanRecord);
+      const planRecordPath =
+        typeof data?.output?.planRecordPath === "string" && data.output.planRecordPath.trim()
+          ? data.output.planRecordPath.trim()
+          : undefined;
       setPendingPlan({
         requestId,
         query: content,
         mode,
+        reusedFromPlanRecord,
+        planRecordPath,
         intentDescription,
         thinking,
         searchEvidence,
@@ -687,6 +887,7 @@ export default function Home() {
         initialStepConfigs[idx] = {
           agent: mode,
           skills: requiredSkills.length > 0 ? [...requiredSkills] : [...recommendedSkills],
+          tools: [],
         };
       });
       setStepExecutionConfigs(initialStepConfigs);
@@ -723,30 +924,36 @@ export default function Home() {
         })),
         clawhubSuggestions,
         executionPlan,
+        savedPath: planRecordPath,
       };
-      try {
-        const saveRes = await fetch(`${apiBaseUrl}/v1/plan-records/save`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: historyItem.query,
-            intentDescription: historyItem.intentDescription,
-            mode: historyItem.mode,
-            planLines: historyItem.lines,
-            recommendedSkills: historyItem.recommendedSkills,
-            supplement: "",
-          }),
-        });
-        const saveData = await saveRes.json().catch(() => ({}));
-        if (saveRes.ok && typeof saveData?.path === "string") {
-          historyItem.savedPath = saveData.path;
+      if (!reusedFromPlanRecord) {
+        try {
+          const saveRes = await fetch(`${apiBaseUrl}/v1/plan-records/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: historyItem.query,
+              intentDescription: historyItem.intentDescription,
+              mode: historyItem.mode,
+              planLines: historyItem.lines,
+              recommendedSkills: historyItem.recommendedSkills,
+              supplement: "",
+            }),
+          });
+          const saveData = await saveRes.json().catch(() => ({}));
+          if (saveRes.ok && typeof saveData?.path === "string") {
+            historyItem.savedPath = saveData.path;
+          }
+        } catch {
+          // Keep UI usable even when local file save fails.
         }
-      } catch {
-        // Keep UI usable even when local file save fails.
       }
       setPlanHistory((prev) => [historyItem, ...prev]);
       // Plan is rendered in a dedicated UI panel below.
     } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        return;
+      }
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       setMessages((prev) => [
@@ -754,8 +961,16 @@ export default function Home() {
         { role: "assistant", content: `Error: ${message}` },
       ]);
     } finally {
+      finishChatAction();
       setLoading(false);
     }
+  }
+
+  async function sendMessage() {
+    const content = input.trim();
+    if (!content) return;
+    setInput("");
+    await sendMessageWithContent(content, { appendUserMessage: true });
   }
 
   async function confirmAndExecute() {
@@ -786,6 +1001,7 @@ export default function Home() {
       step: pendingPlan.lines[idx],
       agent: stepExecutionConfigs[idx]?.agent || pendingPlan.mode,
       skills: stepExecutionConfigs[idx]?.skills || [],
+      tools: stepExecutionConfigs[idx]?.tools || [],
     }));
     const selectedClawhubSlugs = (pendingPlan.clawhubSuggestions ?? [])
       .filter((x) => x.userSelected)
@@ -819,14 +1035,19 @@ export default function Home() {
         done: false,
       }))
     );
-    setMessages((prev) => [...prev, { role: "assistant", content: "已确认计划，开始执行..." }]);
     let blockedExecution = false;
     let capturedTraceId: string | null = null;
     const historyRequestId = pendingPlan.requestId;
+    const resumePendingPlan = pendingPlan;
+    const controller = beginChatAction("execution", async () => {
+      setPendingPlan(resumePendingPlan);
+      await confirmAndExecute();
+    });
     try {
       const res = await fetch(`${apiBaseUrl}/v1/unified/execute/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           requestId: pendingPlan.requestId,
           tenantId,
@@ -904,43 +1125,10 @@ export default function Home() {
           if (payload.type === "trace" && payload.traceId) {
             capturedTraceId = payload.traceId;
             setActiveTraceId(payload.traceId);
-          } else if (payload.type === "status" || payload.type === "mode") {
-            setMessages((prev) => [...prev, { role: "assistant", content: payload.message ?? "" }]);
-          } else if (payload.type === "install") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `安装事件: ${payload.skill ?? "unknown"} -> ${payload.status ?? "unknown"}`,
-              },
-            ]);
-          } else if (payload.type === "thought") {
-            setMessages((prev) => [...prev, { role: "assistant", content: `链路: ${payload.content ?? ""}` }]);
-          } else if (payload.type === "skill_start") {
-            setMessages((prev) => [...prev, { role: "assistant", content: `调用 skill: ${payload.skill ?? ""}` }]);
-          } else if (payload.type === "skill_result") {
-            const lines =
-              Array.isArray(payload.data) && payload.data.length > 0
-                ? payload.data
-                    .map((x) => `- ${x.name ?? x.id ?? "unknown"} (${x.installed ? "installed" : "not installed"})`)
-                    .join("\n")
-                : "no data";
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: `skill结果: ${payload.summary ?? ""}\n${lines}` },
-            ]);
           } else if (payload.type === "step_start") {
             if (payload.stepId) setStepRunState(payload.stepId, "running");
           } else if (payload.type === "step_done") {
             if (payload.stepId) setStepRunState(payload.stepId, payload.status === "failed" ? "failed" : "success");
-          } else if (payload.type === "policy_check") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `策略检查: ${payload.stepId ?? ""} risk=${payload.riskLevel ?? "unknown"} allow=${String(payload.allow)}`,
-              },
-            ]);
           } else if (payload.type === "approval_required") {
             if (payload.stepId) setStepRunState(payload.stepId, "running");
             if (payload.stepId) setPendingApprovalStepId(payload.stepId);
@@ -948,24 +1136,8 @@ export default function Home() {
               ...prev,
               {
                 role: "assistant",
-                content: `需要审批: ${payload.stepId ?? ""} ${payload.reason ?? ""}（${payload.decision ?? "pending"}）`,
-              },
-            ]);
-          } else if (payload.type === "trace_summary") {
-            const s = payload.trace;
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `Trace: total=${s?.total ?? 0}, success=${s?.success ?? 0}, failed=${s?.failed ?? 0}`,
-              },
-            ]);
-          } else if (payload.type === "schema_check") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `Schema: step ${payload.stepId ?? "?"} ok=${String(payload.ok)} ${payload.error ?? ""}`,
+                content: `执行已暂停：需要审批步骤 ${payload.stepId ?? ""}。详情请查看 Trace。`,
+                traceId: capturedTraceId ?? undefined,
               },
             ]);
           } else if (payload.type === "done") {
@@ -976,7 +1148,8 @@ export default function Home() {
                 ...prev,
                 {
                   role: "assistant",
-                  content: `执行已暂停：等待审批步骤 ${payload.pendingApprovalStepId ?? ""}。请在计划面板点击“同意并继续执行”。`,
+                  content: `执行已暂停：等待审批步骤 ${payload.pendingApprovalStepId ?? ""}。详情请查看 Trace。`,
+                  traceId: capturedTraceId ?? undefined,
                 },
               ]);
             } else {
@@ -984,7 +1157,11 @@ export default function Home() {
               setExecutionChecklist((prev) => prev.map((item) => ({ ...item, done: true })));
               setMessages((prev) => [
                 ...prev,
-                { role: "assistant", content: `最终结果:\n${payload.answer ?? ""}` },
+                {
+                  role: "assistant",
+                  content: `${payload.answer ?? ""}`,
+                  traceId: capturedTraceId ?? undefined,
+                },
               ]);
               if (capturedTraceId) {
                 setPlanHistory((prev) =>
@@ -1009,10 +1186,14 @@ export default function Home() {
         setActiveTraceId(null);
       }
     } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        return;
+      }
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${message}` }]);
     } finally {
+      finishChatAction();
       setLoading(false);
     }
   }
@@ -1046,15 +1227,16 @@ export default function Home() {
         done: false,
       }))
     );
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: item.query },
-      { role: "assistant", content: `使用历史计划执行（mode: ${item.mode}）...` },
-    ]);
+    setMessages((prev) => [...prev, { role: "user", content: item.query }]);
+    let capturedTraceId: string | null = item.lastTraceId ?? null;
+    let blockedExecution = false;
+    const historyRequestId = item.requestId;
+    const controller = beginChatAction("history", () => executePlanItem(item));
     try {
       const res = await fetch(`${apiBaseUrl}/v1/unified/execute/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           requestId: item.requestId || newRequestId(),
           tenantId,
@@ -1111,93 +1293,80 @@ export default function Home() {
           if (!dataLine) continue;
           const payload = JSON.parse(dataLine.slice(6)) as {
             type: string;
-            message?: string;
-            content?: string;
             answer?: string;
-            skill?: string;
+            blocked?: boolean;
+            pendingApprovalStepId?: string;
             status?: string;
             stepId?: string;
-            stepIndex?: number;
-            step?: string;
-            summary?: string;
-            riskLevel?: string;
-            allow?: boolean;
             reason?: string;
             decision?: string;
-            trace?: { total?: number; success?: number; failed?: number };
-            data?: Array<{ id?: string; name?: string; installed?: boolean }>;
+            traceId?: string;
           };
-          if (payload.type === "status" || payload.type === "mode") {
-            setMessages((prev) => [...prev, { role: "assistant", content: payload.message ?? "" }]);
-          } else if (payload.type === "install") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `安装事件: ${payload.skill ?? "unknown"} -> ${payload.status ?? "unknown"}`,
-              },
-            ]);
-          } else if (payload.type === "thought") {
-            setMessages((prev) => [...prev, { role: "assistant", content: `链路: ${payload.content ?? ""}` }]);
-          } else if (payload.type === "skill_start") {
-            setMessages((prev) => [...prev, { role: "assistant", content: `调用 skill: ${payload.skill ?? ""}` }]);
-          } else if (payload.type === "skill_result") {
-            const lines =
-              Array.isArray(payload.data) && payload.data.length > 0
-                ? payload.data
-                    .map((x) => `- ${x.name ?? x.id ?? "unknown"} (${x.installed ? "installed" : "not installed"})`)
-                    .join("\n")
-                : "no data";
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: `skill结果: ${payload.summary ?? ""}\n${lines}` },
-            ]);
+          if (payload.type === "trace" && payload.traceId) {
+            capturedTraceId = payload.traceId;
+            setActiveTraceId(payload.traceId);
           } else if (payload.type === "step_start") {
             if (payload.stepId) setStepRunState(payload.stepId, "running");
           } else if (payload.type === "step_done") {
             if (payload.stepId) setStepRunState(payload.stepId, payload.status === "failed" ? "failed" : "success");
-          } else if (payload.type === "policy_check") {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `策略检查: ${payload.stepId ?? ""} risk=${payload.riskLevel ?? "unknown"} allow=${String(payload.allow)}`,
-              },
-            ]);
           } else if (payload.type === "approval_required") {
             if (payload.stepId) setStepRunState(payload.stepId, "running");
+            if (payload.stepId) setPendingApprovalStepId(payload.stepId);
             setMessages((prev) => [
               ...prev,
               {
                 role: "assistant",
-                content: `需要审批: ${payload.stepId ?? ""} ${payload.reason ?? ""}（${payload.decision ?? "pending"}）`,
-              },
-            ]);
-          } else if (payload.type === "trace_summary") {
-            const s = payload.trace;
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: `Trace: total=${s?.total ?? 0}, success=${s?.success ?? 0}, failed=${s?.failed ?? 0}`,
+                content: `执行已暂停：需要审批步骤 ${payload.stepId ?? ""}。详情请查看 Trace。`,
+                traceId: capturedTraceId ?? undefined,
               },
             ]);
           } else if (payload.type === "done") {
-            setExecutionChecklist((prev) => prev.map((check) => ({ ...check, done: true })));
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: `最终结果:\n${payload.answer ?? ""}` },
-            ]);
+            if (payload.blocked) {
+              blockedExecution = true;
+              setPendingApprovalStepId(payload.pendingApprovalStepId ?? null);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  role: "assistant",
+                  content: `执行已暂停：等待审批步骤 ${payload.pendingApprovalStepId ?? ""}。详情请查看 Trace。`,
+                  traceId: capturedTraceId ?? undefined,
+                },
+              ]);
+            } else {
+              setPendingApprovalStepId(null);
+              setExecutionChecklist((prev) => prev.map((check) => ({ ...check, done: true })));
+              setMessages((prev) => [
+                ...prev,
+                {
+                  role: "assistant",
+                  content: `${payload.answer ?? ""}`,
+                  traceId: capturedTraceId ?? undefined,
+                },
+              ]);
+              if (capturedTraceId) {
+                setPlanHistory((prev) =>
+                  prev.map((it) =>
+                    it.requestId === historyRequestId ? { ...it, lastTraceId: capturedTraceId! } : it
+                  )
+                );
+              }
+            }
           }
         }
       }
     } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        return;
+      }
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${message}` }]);
     } finally {
+      finishChatAction();
       setLoading(false);
-      setExecutionStepStates({});
+      if (!blockedExecution) {
+        setExecutionStepStates({});
+      }
     }
   }
 
@@ -1274,19 +1443,83 @@ export default function Home() {
     setPlanBranchInput({});
     const initialStepConfigs: Record<number, StepExecutionConfig> =
       item.stepExecutionConfigs && Object.keys(item.stepExecutionConfigs).length > 0
-        ? item.stepExecutionConfigs
+        ? Object.fromEntries(
+            Object.entries(item.stepExecutionConfigs).map(([key, value]) => [
+              Number(key),
+              {
+                agent: value.agent,
+                skills: Array.isArray(value.skills) ? value.skills : [],
+                tools: Array.isArray(value.tools) ? value.tools : [],
+              },
+            ])
+          )
         : (() => {
             const fallback: Record<number, StepExecutionConfig> = {};
             item.lines.forEach((_, idx) => {
               fallback[idx] = {
                 agent: item.mode,
                 skills: [...item.recommendedSkills],
+                tools: [],
               };
             });
             return fallback;
           })();
     setStepExecutionConfigs(initialStepConfigs);
     setStrategy(item.mode);
+  }
+
+  async function loadTrace(traceId: string) {
+    setTraceLoading(true);
+    setTraceError(null);
+    setTraceViewerId(traceId);
+    setTraceViewerRun(null);
+    try {
+      const otieRes = await fetch(`${apiBaseUrl}/v1/otie/runs/${encodeURIComponent(traceId)}`);
+      const otieData = await otieRes.json().catch(() => ({}));
+      if (otieRes.ok && otieData?.run) {
+        setTraceViewerRun(otieData.run);
+        return;
+      }
+
+      const traceRes = await fetch(`${apiBaseUrl}/v1/traces/${encodeURIComponent(traceId)}`);
+      const traceData = await traceRes.json().catch(() => ({}));
+      if (!traceRes.ok) {
+        throw new Error(otieData?.detail ?? traceData?.detail ?? "load trace failed");
+      }
+      setTraceViewerRun({
+        traceId,
+        runId: traceId,
+        status: "legacy-trace",
+        finalAnswer: "",
+        stepOutputs: {},
+        events: Array.isArray(traceData?.events) ? traceData.events : [],
+      });
+    } catch (err) {
+      setTraceError(err instanceof Error ? err.message : "load trace failed");
+    } finally {
+      setTraceLoading(false);
+    }
+  }
+
+  async function openTrace(traceId: string, requestId?: string) {
+    setTraceOpen(true);
+    if (requestId) {
+      try {
+        const res = await fetch(`${apiBaseUrl}/v1/traces?requestId=${encodeURIComponent(requestId)}`);
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && Array.isArray(data?.traceIds)) {
+          const ids = data.traceIds.map((x: unknown) => String(x)).filter((x: string) => x.trim().length > 0);
+          setTraceViewerIds(ids.length > 0 ? ids : [traceId]);
+        } else {
+          setTraceViewerIds([traceId]);
+        }
+      } catch {
+        setTraceViewerIds([traceId]);
+      }
+    } else {
+      setTraceViewerIds([traceId]);
+    }
+    await loadTrace(traceId);
   }
 
   function updatePendingTaskChecklist(checklist: ExecutionChecklistItem[]) {
@@ -1726,6 +1959,14 @@ export default function Home() {
     return capabilitySkills.filter((s) => Boolean(s.whitelisted)).map((s) => s.id);
   }, [capabilityWhitelist, capabilitySkills]);
 
+  const allowlistedTools = useMemo(() => {
+    const tools = capabilityTools
+      .filter((tool) => Boolean(tool.allowlisted) && !tool.denylisted)
+      .map((tool) => tool.id);
+    if (tools.length > 0) return tools;
+    return capabilityTools.filter((tool) => !tool.denylisted).map((tool) => tool.id);
+  }, [capabilityTools]);
+
   function updateStepAgent(stepIndex: number, agentId: string) {
     setStepExecutionConfigs((prev) => {
       const next = {
@@ -1733,6 +1974,7 @@ export default function Home() {
         [stepIndex]: {
           agent: agentId,
           skills: prev[stepIndex]?.skills ?? [],
+          tools: prev[stepIndex]?.tools ?? [],
         },
       };
       if (pendingPlan) {
@@ -1748,7 +1990,7 @@ export default function Home() {
 
   function toggleStepSkill(stepIndex: number, skillId: string, enabled: boolean) {
     setStepExecutionConfigs((prev) => {
-      const current = prev[stepIndex] ?? { agent: pendingPlan?.mode ?? "agent", skills: [] };
+      const current = prev[stepIndex] ?? { agent: pendingPlan?.mode ?? "agent", skills: [], tools: [] };
       const nextSkills = enabled
         ? Array.from(new Set([...current.skills, skillId]))
         : current.skills.filter((x) => x !== skillId);
@@ -1762,7 +2004,7 @@ export default function Home() {
         items.map((item) => {
           if (item.requestId !== pendingPlan.requestId) return item;
           const current = item.stepExecutionConfigs ?? {};
-          const stepCurrent = current[stepIndex] ?? { agent: pendingPlan.mode, skills: [] };
+          const stepCurrent = current[stepIndex] ?? { agent: pendingPlan.mode, skills: [], tools: [] };
           const nextSkills = enabled
             ? Array.from(new Set([...(stepCurrent.skills ?? []), skillId]))
             : (stepCurrent.skills ?? []).filter((x) => x !== skillId);
@@ -1771,6 +2013,38 @@ export default function Home() {
             stepExecutionConfigs: {
               ...current,
               [stepIndex]: { ...stepCurrent, skills: nextSkills },
+            },
+          };
+        })
+      );
+    }
+  }
+
+  function toggleStepTool(stepIndex: number, toolId: string, enabled: boolean) {
+    setStepExecutionConfigs((prev) => {
+      const current = prev[stepIndex] ?? { agent: pendingPlan?.mode ?? "agent", skills: [], tools: [] };
+      const nextTools = enabled
+        ? Array.from(new Set([...(current.tools ?? []), toolId]))
+        : (current.tools ?? []).filter((x) => x !== toolId);
+      return {
+        ...prev,
+        [stepIndex]: { ...current, tools: nextTools },
+      };
+    });
+    if (pendingPlan) {
+      setPlanHistory((items) =>
+        items.map((item) => {
+          if (item.requestId !== pendingPlan.requestId) return item;
+          const current = item.stepExecutionConfigs ?? {};
+          const stepCurrent = current[stepIndex] ?? { agent: pendingPlan.mode, skills: [], tools: [] };
+          const nextTools = enabled
+            ? Array.from(new Set([...(stepCurrent.tools ?? []), toolId]))
+            : (stepCurrent.tools ?? []).filter((x) => x !== toolId);
+          return {
+            ...item,
+            stepExecutionConfigs: {
+              ...current,
+              [stepIndex]: { ...stepCurrent, tools: nextTools },
             },
           };
         })
@@ -1864,6 +2138,18 @@ export default function Home() {
           <AppButton type="button" onClick={newChat}>
             New Chat
           </AppButton>
+          <AppButton
+            type="button"
+            onClick={async () => {
+              setRagOpen(true);
+              await loadRagViewer();
+            }}
+          >
+            RAG
+          </AppButton>
+          <AppButton type="button" onClick={() => setSettingsOpen(true)}>
+            Settings
+          </AppButton>
           <AppButton type="button" onClick={() => setDeepseekOpen(true)}>
             DeepSeek
           </AppButton>
@@ -1939,37 +2225,6 @@ export default function Home() {
         </aside>
 
         <section className="flex flex-col gap-4">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <label className="flex flex-col gap-1">
-            <span className="text-sm text-zinc-600 dark:text-zinc-300">tenantId</span>
-            <input
-              className="border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900"
-              value={tenantId}
-              onChange={(e) => setTenantId(e.target.value)}
-            />
-          </label>
-
-          <label className="flex flex-col gap-1">
-            <span className="text-sm text-zinc-600 dark:text-zinc-300">strategy</span>
-            <select
-              className="border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900"
-              value={strategy}
-              onChange={(e) => setStrategy(e.target.value as Strategy)}
-            >
-              <option value="auto">auto</option>
-              <option value="agent">agent</option>
-              <option value="react">react</option>
-              <option value="workflow">workflow</option>
-            </select>
-          </label>
-
-          <div className="flex items-end">
-            <div className="text-xs text-zinc-500">
-              API: <span className="font-mono">{apiBaseUrl}</span>
-            </div>
-          </div>
-        </div>
-
         <ChatPanel
           messages={messages}
           loading={loading}
@@ -1977,39 +2232,101 @@ export default function Home() {
           input={input}
           onInputChange={setInput}
           onSend={sendMessage}
+          canStop={loading}
+          onStop={stopChatAction}
+          canResume={canResumeChatAction}
+          onResume={resumeChatAction}
+          resumeLabel={resumeChatActionLabel}
+          onOpenTrace={openTrace}
         />
 
         {pendingPlan ? (
           <div className="p-3 border border-zinc-300 dark:border-zinc-700 rounded bg-amber-50/70 dark:bg-zinc-900">
-            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
-              执行计划待确认（mode: {pendingPlan.mode}）
-            </div>
-            <div className="mt-2 flex items-center gap-2">
-              <div className="text-xs text-zinc-500">执行模式</div>
-              <select
-                className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
-                value={pendingPlan.executionMode}
-                onChange={(e) =>
-                  setPendingPlan((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          executionMode: e.target.value === "user_exec" ? "user_exec" : "auto_exec",
-                        }
-                      : prev
-                  )
-                }
-              >
-                <option value="auto_exec">系统自动执行（exec + test）</option>
-                <option value="user_exec">用户自行执行（仅输出 checklist）</option>
-              </select>
-            </div>
-            <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-              用户问题：{pendingPlan.query}
-            </div>
-            <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
-              意图：{pendingPlan.intentDescription}
-            </div>
+            {pendingPlan.reusedFromPlanRecord ? (
+              <>
+                <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">命中历史计划记录</div>
+                <div className="mt-3 border border-zinc-200 dark:border-zinc-700 rounded p-3 bg-white/70 dark:bg-zinc-800">
+                  <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{pendingPlan.query}</div>
+                  <div className="mt-1 text-xs text-zinc-500">mode: {pendingPlan.mode}</div>
+                  <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+                    意图：{pendingPlan.intentDescription}
+                  </div>
+                  <div className="mt-2 space-y-1 text-xs text-zinc-700 dark:text-zinc-300">
+                    {pendingPlan.lines.map((line, idx) => (
+                      <div key={`reused-plan-${idx}`}>{idx + 1}. {line}</div>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-[11px] text-zinc-500">
+                    skill: {pendingPlan.recommendedSkills.length > 0 ? pendingPlan.recommendedSkills.join(", ") : "none"}
+                  </div>
+                  {pendingPlan.planRecordPath ? (
+                    <div className="mt-1 text-[10px] font-mono text-zinc-500 break-all">{pendingPlan.planRecordPath}</div>
+                  ) : null}
+                </div>
+                <div className="mt-3 flex items-center gap-2">
+                  {pendingPlan.executionMode === "user_exec" ? (
+                    <AppButton type="button" size="md" variant="info" onClick={continueChatWithChecklist}>
+                      按选中 checklist 继续对话
+                    </AppButton>
+                  ) : (
+                    <AppButton type="button" size="md" variant="success" onClick={() => void confirmAndExecute()} disabled={loading}>
+                      执行
+                    </AppButton>
+                  )}
+                  <AppButton type="button" size="md" onClick={cancelPlan} disabled={loading}>
+                    取消
+                  </AppButton>
+                  <AppButton
+                    type="button"
+                    onClick={() =>
+                      openTaskFlow(
+                        {
+                          title: `${pendingPlan.query} (查看)`,
+                          mode: pendingPlan.mode,
+                          lines: buildConfirmedPlanLines(pendingPlan.lines),
+                          skills: pendingPlan.recommendedSkills,
+                        },
+                        false
+                      )
+                    }
+                    size="md"
+                    variant="info"
+                  >
+                    查看 Flow
+                  </AppButton>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                  执行计划待确认（mode: {pendingPlan.mode}）
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <div className="text-xs text-zinc-500">执行模式</div>
+                  <select
+                    className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                    value={pendingPlan.executionMode}
+                    onChange={(e) =>
+                      setPendingPlan((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              executionMode: e.target.value === "user_exec" ? "user_exec" : "auto_exec",
+                            }
+                          : prev
+                      )
+                    }
+                  >
+                    <option value="auto_exec">系统自动执行（exec + test）</option>
+                    <option value="user_exec">用户自行执行（仅输出 checklist）</option>
+                  </select>
+                </div>
+                <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                  用户问题：{pendingPlan.query}
+                </div>
+                <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+                  意图：{pendingPlan.intentDescription}
+                </div>
             {pendingPlan.thinking ? (
               <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap">
                 思考：{pendingPlan.thinking}
@@ -2211,6 +2528,27 @@ export default function Home() {
                           </div>
                         </div>
                       </div>
+                      <div className="mb-2">
+                        <div className="text-xs text-zinc-500 mb-1">tools</div>
+                        <div className="flex flex-wrap gap-2">
+                          {allowlistedTools.map((tid) => (
+                            <label
+                              key={`${idx}-tool-${tid}`}
+                              className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={Boolean(stepExecutionConfigs[idx]?.tools?.includes(tid))}
+                                onChange={(e) => toggleStepTool(idx, tid, e.target.checked)}
+                              />
+                              {tid}
+                            </label>
+                          ))}
+                          {allowlistedTools.length === 0 ? (
+                            <div className="text-xs text-zinc-400">暂无可用 tool</div>
+                          ) : null}
+                        </div>
+                      </div>
                       <div className="text-xs text-zinc-500 mb-1">后续分支</div>
                       {renderBranchEditor(idx, null, 0)}
                     </div>
@@ -2370,6 +2708,8 @@ export default function Home() {
                 Task Flow
               </AppButton>
             </div>
+              </>
+            )}
           </div>
         ) : null}
 
@@ -2419,8 +2759,10 @@ export default function Home() {
         loadCapabilities={loadCapabilities}
         capabilityAgents={capabilityAgents}
         capabilitySkills={capabilitySkills}
+        capabilityTools={capabilityTools}
         installSkill={installSkill}
         toggleWhitelist={toggleWhitelist}
+        toggleToolPolicy={toggleToolPolicy}
         capabilityPage={capabilityPage}
         capabilitySkillsTotal={capabilitySkillsTotal}
         capabilityPageSize={capabilityPageSize}
@@ -2452,6 +2794,36 @@ export default function Home() {
         deepseekConfig={deepseekConfig}
         setDeepseekConfig={setDeepseekConfig}
       />
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        tenantId={tenantId}
+        strategy={strategy}
+        setTenantId={setTenantId}
+        setStrategy={setStrategy}
+        ragConfig={ragConfig}
+        setRagConfig={setRagConfig}
+        apiBaseUrl={apiBaseUrl}
+      />
+      <RagViewerModal
+        open={ragOpen}
+        onClose={() => setRagOpen(false)}
+        tenantId={tenantId}
+        loading={ragLoading}
+        error={ragError}
+        selectedScope={ragSelectedScope}
+        setSelectedScope={(value) => {
+          setRagSelectedScope(value);
+          void loadRagViewer(value);
+        }}
+        scopes={ragScopes}
+        documents={ragDocuments}
+        graph={ragGraph}
+        onRefresh={async () => {
+          await loadRagViewer();
+        }}
+        onAddDocument={addRagDocument}
+      />
       <PlanRecordModal
         open={planRecordOpen}
         onClose={() => setPlanRecordOpen(false)}
@@ -2462,6 +2834,7 @@ export default function Home() {
         loadHistoryPlan={loadHistoryPlan}
         executePlanItem={executePlanItem}
         openTaskFlow={openTaskFlow}
+        openTrace={openTrace}
         toggleFavorite={toggleFavorite}
         deletePlanItem={deletePlanItem}
       />
@@ -2469,6 +2842,16 @@ export default function Home() {
         selectedPlanRecord={selectedPlanRecord}
         setSelectedPlanRecord={setSelectedPlanRecord}
         openTaskFlow={openTaskFlow}
+      />
+      <TraceModal
+        open={traceOpen}
+        onClose={() => setTraceOpen(false)}
+        loading={traceLoading}
+        traceId={traceViewerId}
+        traceIds={traceViewerIds}
+        onSelectTrace={loadTrace}
+        run={traceViewerRun}
+        error={traceError}
       />
     </div>
   );

@@ -23,5 +23,24 @@ class Settings(BaseSettings):
     clawhub_workspace_sync_enabled: bool = Field(default=False, alias="CLAWHUB_WORKSPACE_SYNC_ENABLED")
     clawhub_workspace_path: str = Field(default="", alias="CLAWHUB_WORKSPACE_PATH")
 
+    # Weather tool defaults (Open-Meteo public endpoints).
+    weather_geocode_base_url: str = Field(
+        default="https://geocoding-api.open-meteo.com/v1/search",
+        alias="WEATHER_GEOCODE_BASE_URL",
+    )
+    weather_forecast_base_url: str = Field(
+        default="https://api.open-meteo.com/v1/forecast",
+        alias="WEATHER_FORECAST_BASE_URL",
+    )
+
+    # Zep-backed RAG settings.
+    zep_base_url: str = Field(default="https://api.getzep.com", alias="ZEP_BASE_URL")
+    zep_api_key: str = Field(default="", alias="ZEP_API_KEY")
+    zep_collection_prefix: str = Field(default="aichatflow", alias="ZEP_COLLECTION_PREFIX")
+    zep_embedding_dimensions: int = Field(default=1536, alias="ZEP_EMBEDDING_DIMENSIONS")
+    rag_chunk_size: int = Field(default=800, alias="RAG_CHUNK_SIZE")
+    rag_chunk_overlap: int = Field(default=120, alias="RAG_CHUNK_OVERLAP")
+    rag_default_top_k: int = Field(default=5, alias="RAG_DEFAULT_TOP_K")
+
 
 settings = Settings()

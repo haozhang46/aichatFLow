@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import re
+from typing import Any
 
 
 class PlanRecordService:
@@ -44,6 +45,19 @@ class PlanRecordService:
         path.write_text(content, encoding="utf-8")
         return str(path)
 
+    def find_latest_by_query(self, query: str) -> dict[str, Any] | None:
+        normalized_query = self._normalize_query(query)
+        if not normalized_query:
+            return None
+        candidates = sorted(self._plan_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in candidates:
+            parsed = self._parse_plan_record(path)
+            if not parsed:
+                continue
+            if self._normalize_query(str(parsed.get("query", ""))) == normalized_query:
+                return parsed
+        return None
+
     def _build_tasks(self, plan_lines: list[str], mode: str, skills: list[str]) -> list[str]:
         skill_text = ", ".join(skills) if skills else "none"
         return [
@@ -51,8 +65,57 @@ class PlanRecordService:
             for idx, line in enumerate(plan_lines)
         ]
 
+    def _parse_plan_record(self, path: Path) -> dict[str, Any] | None:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        lines = content.splitlines()
+        if not lines or not lines[0].startswith("# Plan Record:"):
+            return None
+
+        query = lines[0].replace("# Plan Record:", "", 1).strip()
+        mode_match = re.search(r"^- mode:\s*(.+)$", content, flags=re.MULTILINE)
+        skills_match = re.search(r"^- skills:\s*(.+)$", content, flags=re.MULTILINE)
+        intent = self._extract_section(content, "## 1. 用户意图描述", "## 2. 计划")
+        plan_block = self._extract_section(content, "## 2. 计划", "## 3. task")
+        supplement = self._extract_section(content, "## 补充说明", None)
+        plan_lines = []
+        for line in plan_block.splitlines():
+            matched = re.match(r"^\s*\d+\.\s*(.+?)\s*$", line)
+            if matched:
+                plan_lines.append(matched.group(1).strip())
+
+        skills_text = (skills_match.group(1).strip() if skills_match else "none").strip()
+        recommended_skills = [] if skills_text.lower() == "none" else [s.strip() for s in skills_text.split(",") if s.strip()]
+        return {
+            "path": str(path),
+            "query": query,
+            "mode": mode_match.group(1).strip() if mode_match else "auto",
+            "intentDescription": intent.strip() or f"用户希望解决：{query}",
+            "planLines": plan_lines,
+            "recommendedSkills": recommended_skills,
+            "supplement": "" if supplement.strip().lower() == "none" else supplement.strip(),
+        }
+
+    def _extract_section(self, content: str, start_heading: str, end_heading: str | None) -> str:
+        start = content.find(start_heading)
+        if start < 0:
+            return ""
+        start += len(start_heading)
+        if end_heading:
+            end = content.find(end_heading, start)
+            block = content[start:end if end >= 0 else None]
+        else:
+            block = content[start:]
+        return block.strip()
+
     def _slugify(self, text: str) -> str:
         value = re.sub(r"\s+", "-", text.strip().lower())
         value = re.sub(r"[^a-z0-9\-_]+", "-", value)
         value = re.sub(r"-{2,}", "-", value).strip("-")
         return value[:48]
+
+    def _normalize_query(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip().lower())

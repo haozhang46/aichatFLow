@@ -1,6 +1,7 @@
 from uuid import uuid4
 from datetime import datetime
 import json
+import time
 from typing import Any, Optional
 
 import httpx
@@ -16,23 +17,24 @@ from app.api.deps import (
     metrics_service,
     personal_skill_tree_service,
     plan_record_service,
-    policy_engine,
     routing_service,
     skill_executor_service,
     trace_store,
+    otie_runtime,
+    otie_intent_service,
+    otie_planner,
+    tool_registry,
+    tool_policy_service,
 )
+from app.contracts.otie import ExecutionPlan, OtieRequestInput, PlanStep, RetryPolicy
 from app.schemas.unified import UnifiedRequest
 from app.services.execution_steps import normalize_execution_steps
 from app.orchestrator.graph import (
     build_plan_context,
-    run_orchestrator,
-    run_orchestrator_stream,
-    run_orchestrator_stream_for_step,
 )
 from app.core.config import settings
 from app.services.clawhub_service import search_skills as clawhub_search_skills
 from app.services.clawhub_plan_analysis import build_clawhub_plan_suggestions
-from app.services.schema_validation import validate_llm_text_against_schema
 
 router = APIRouter()
 
@@ -52,6 +54,12 @@ class CapabilityInstallIn(BaseModel):
 class CapabilityWhitelistIn(BaseModel):
     skill_id: str = Field(alias="skillId")
     enabled: bool
+
+
+class ToolPolicyIn(BaseModel):
+    tool_id: str = Field(alias="toolId")
+    allowlisted: Optional[bool] = None
+    denylisted: Optional[bool] = None
 
 
 class OnlineSkillAddIn(BaseModel):
@@ -119,6 +127,15 @@ def _get_execution_mode(payload: UnifiedRequest, query: str) -> str:
     return _suggest_execution_mode(query)
 
 
+def _has_rag_request(payload: UnifiedRequest) -> bool:
+    raw = (payload.inputs or {}).get("rag")
+    if not isinstance(raw, dict):
+        return False
+    if bool(raw.get("enabled")):
+        return True
+    return bool(str(raw.get("scope") or "").strip())
+
+
 def _build_execution_plan(plan_lines: list[str], mode: str) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
     for idx, line in enumerate(plan_lines):
@@ -147,28 +164,183 @@ def _coerce_step_strategy(step_agent: str, fallback: str) -> str:
     return fallback
 
 
+def _build_otie_request(payload: UnifiedRequest, query: str) -> OtieRequestInput:
+    return OtieRequestInput(
+        requestId=payload.request_id,
+        tenantId=payload.tenant_id,
+        requestType=payload.request_type,
+        messages=[{"role": "user", "content": query}],
+        inputs=payload.inputs or {},
+        metadata=payload.metadata or {},
+    )
+
+
+def _build_otie_plan_from_steps(
+    *,
+    request_id: str,
+    intent_id: str,
+    default_mode: str,
+    steps: list[dict[str, Any]],
+) -> ExecutionPlan:
+    plan_steps: list[PlanStep] = []
+    for idx, step in enumerate(steps):
+        step_id = str(step.get("id") or f"s{idx + 1}")
+        skills = [str(s).strip() for s in (step.get("skills") or []) if str(s).strip()]
+        tools = [str(t).strip() for t in (step.get("tools") or []) if str(t).strip()]
+        depends_on = [str(s) for s in (step.get("dependsOn") or []) if str(s).strip()]
+        for skill_index, skill_id in enumerate(skills):
+            skill_step_id = f"{step_id}_tool_{skill_index + 1}"
+            skill_depends = list(depends_on) if skill_index == 0 else [plan_steps[-1].id]
+            plan_steps.append(
+                PlanStep(
+                    stepId=skill_step_id,
+                    kind="tool",
+                    action=f"Execute skill `{skill_id}` for step `{step_id}`.",
+                    dependsOn=skill_depends,
+                    toolId="execute-skill",
+                    toolArgs={"skillId": skill_id, "query": str(step.get('action') or '')},
+                    agent="auto",
+                )
+            )
+            depends_on = [skill_step_id]
+        for tool_index, tool_id in enumerate(tools):
+            tool_step_id = f"{step_id}_otie_tool_{tool_index + 1}"
+            tool_depends = list(depends_on) if tool_index == 0 else [plan_steps[-1].id]
+            plan_steps.append(
+                PlanStep(
+                    stepId=tool_step_id,
+                    kind="tool",
+                    action=f"Execute tool `{tool_id}` for step `{step_id}`.",
+                    dependsOn=tool_depends,
+                    toolId=tool_id,
+                    toolArgs={"query": str(step.get("action") or "")},
+                    agent="auto",
+                )
+            )
+            depends_on = [tool_step_id]
+
+        kind = "tool" if str(step.get("type") or "").strip() == "tool" else "reason"
+        tool_id = None
+        tool_args = {}
+        if kind == "tool":
+            tool_id = str(step.get("toolId") or "").strip() or "execute-skill"
+            tool_args = step.get("input") if isinstance(step.get("input"), dict) else {}
+        plan_steps.append(
+            PlanStep(
+                stepId=step_id,
+                kind=kind,
+                action=str(step.get("action") or ""),
+                dependsOn=depends_on,
+                agent=_coerce_step_strategy(str(step.get("agent") or default_mode), default_mode),
+                toolId=tool_id,
+                toolArgs=tool_args,
+                retryPolicy=RetryPolicy.model_validate(step.get("retryPolicy") or {}),
+                timeoutMs=step.get("timeoutMs"),
+                outputSchema=step.get("outputSchema"),
+            )
+        )
+
+    if not plan_steps or plan_steps[-1].kind != "respond":
+        plan_steps.append(
+            PlanStep(
+                stepId=f"s{len(plan_steps) + 1}",
+                kind="respond",
+                action="Compose the final response from completed step outputs.",
+                dependsOn=[plan_steps[-1].id] if plan_steps else [],
+                agent="agent",
+            )
+        )
+
+    return ExecutionPlan(
+        planId=f"plan_{request_id}",
+        intentId=intent_id,
+        mode=default_mode if default_mode in {"agent", "react", "workflow"} else "agent",
+        status="ready",
+        maxSteps=max(len(plan_steps) + 2, 4),
+        steps=plan_steps,
+    )
+
+
+async def _resolve_otie_plan_for_payload(
+    payload: UnifiedRequest,
+    *,
+    query: str,
+    strategy: str,
+) -> tuple[OtieRequestInput, Any, ExecutionPlan]:
+    otie_request = _build_otie_request(payload, query)
+    intent = otie_intent_service.normalize(otie_request)
+
+    execution_plan = (payload.inputs or {}).get("executionPlan")
+    confirmed_plan = (payload.inputs or {}).get("confirmedPlan")
+    step_executions = (payload.inputs or {}).get("stepExecutions")
+    step_overrides = (payload.inputs or {}).get("stepOverrides")
+
+    if isinstance(execution_plan, dict) or isinstance(confirmed_plan, list):
+        default_mode = strategy
+        if isinstance(execution_plan, dict):
+            raw_mode = execution_plan.get("mode")
+            if isinstance(raw_mode, str) and raw_mode.strip():
+                default_mode = raw_mode.strip()
+        steps = normalize_execution_steps(
+            execution_plan=execution_plan if isinstance(execution_plan, dict) else None,
+            confirmed_plan=confirmed_plan if isinstance(confirmed_plan, list) else None,
+            step_executions=step_executions if isinstance(step_executions, list) else None,
+            default_mode=default_mode,
+            step_overrides=step_overrides if isinstance(step_overrides, dict) else None,
+        )
+        plan = _build_otie_plan_from_steps(
+            request_id=payload.request_id,
+            intent_id=intent.intent_id,
+            default_mode=default_mode,
+            steps=steps,
+        )
+        return otie_request, intent, plan
+
+    plan = await otie_planner.build_plan(intent)
+    return otie_request, intent, plan
+
+
 @router.post("/v1/unified/execute")
 async def execute_unified(payload: UnifiedRequest):
-    trace_id = f"trace_{uuid4().hex[:12]}"
     # For chat requests, use LangChain/LangGraph orchestrator to select agent/react/workflow automatically.
     if payload.request_type == "chat":
         query = (payload.messages or [{"content": ""}])[0].get("content", "")
         strategy = _get_strategy(payload)
-        llm_config = _get_llm_config(payload)
-        mode, answer, latency_ms = await run_orchestrator(query, strategy=strategy, llm_config=llm_config)
+        started = time.monotonic()
+        _, intent, plan = await _resolve_otie_plan_for_payload(payload, query=query, strategy=strategy)
+        result = await otie_runtime.run(
+            intent,
+            plan,
+            step_approvals=(payload.inputs or {}).get("stepApprovals")
+            if isinstance((payload.inputs or {}).get("stepApprovals"), dict)
+            else {},
+        )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        status = "success"
+        if result.status == "awaiting_approval":
+            status = "partial"
+        elif result.status == "failed":
+            status = "failed"
         return {
             "requestId": payload.request_id,
             "provider": "langchain",
-            "status": "success",
-            "output": {"mode": mode, "answer": answer},
-            "error": None,
+            "status": status,
+            "output": {
+                "mode": plan.mode,
+                "answer": result.final_answer,
+                "runId": result.run_id,
+                "executionPlan": plan.model_dump(by_alias=True),
+                "stepOutputs": result.step_outputs,
+            },
+            "error": None if status != "failed" else {"message": result.final_answer},
             "latencyMs": latency_ms,
-            "traceId": trace_id,
+            "traceId": result.trace_id,
             "fallbackUsed": False,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
     # For workflow requests, keep the previous FastGPT/Dify execution path.
+    trace_id = f"trace_{uuid4().hex[:12]}"
     try:
         route = await routing_service.resolve(payload)
     except ValueError as exc:
@@ -188,6 +360,46 @@ async def plan_unified(payload: UnifiedRequest):
     strategy = _get_strategy(payload)
     llm_config = _get_llm_config(payload)
     execution_mode = _get_execution_mode(payload, query)
+    reused_record = None if _has_rag_request(payload) else plan_record_service.find_latest_by_query(query)
+    if reused_record:
+        mode = str(reused_record.get("mode") or strategy or "auto")
+        plan_lines = [str(x).strip() for x in reused_record.get("planLines", []) if str(x).strip()]
+        execution_plan = _build_execution_plan(plan_lines, mode)
+        rec = capability_service.recommend(query, mode)
+        recommended_skills = reused_record.get("recommendedSkills", [])
+        if recommended_skills:
+            rec["recommendedSkills"] = recommended_skills
+            rec["requiredSkills"] = recommended_skills
+            rec["missingSkills"] = [
+                skill_id for skill_id in recommended_skills if skill_id not in capability_service.list_whitelist()
+            ]
+            rec["installRequired"] = len(rec["missingSkills"]) > 0
+        metrics_service.record_plan(success=True)
+        return {
+            "requestId": payload.request_id,
+            "provider": "langchain",
+            "status": "success",
+            "output": {
+                "phase": "plan",
+                "mode": mode,
+                "plan": plan_lines,
+                "executionPlan": execution_plan,
+                "executionMode": execution_mode,
+                "intentDescription": reused_record.get("intentDescription", f"用户希望解决：{query}"),
+                "thinking": "Reused existing plan record for identical query.",
+                "searchEvidence": [],
+                "clawhubPlanSuggestions": [],
+                "reusedFromPlanRecord": True,
+                "planRecordPath": reused_record.get("path"),
+                "requiredSkills": rec.get("requiredSkills", []),
+                **rec,
+            },
+            "error": None,
+            "latencyMs": 0,
+            "traceId": trace_id,
+            "fallbackUsed": False,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
     plan_context = await build_plan_context(query, strategy=strategy, llm_config=llm_config)
     mode = plan_context["mode"]
     plan_lines = plan_context["plan"]
@@ -217,6 +429,7 @@ async def plan_unified(payload: UnifiedRequest):
             "thinking": plan_context.get("thinking", ""),
             "searchEvidence": plan_context.get("searchEvidence", []),
             "clawhubPlanSuggestions": clawhub_plan_suggestions,
+            "reusedFromPlanRecord": False,
             "requiredSkills": rec.get("recommendedSkills", []),
             **rec,
         },
@@ -246,13 +459,18 @@ async def list_capabilities(q: Optional[str] = None, page: int = 1, pageSize: in
             or keyword in a["label"].lower()
             or keyword in a.get("description", "").lower()
         ]
+    tools = []
+    for item in tool_registry.describe_tools():
+        tools.append({**item, **tool_policy_service.status_for(str(item["id"]))})
     return {
         "agents": builtin_agents + custom_agents,
         "skills": skills_page["items"],
+        "tools": tools,
         "skillsTotal": skills_page["total"],
         "page": skills_page["page"],
         "pageSize": skills_page["pageSize"],
         "whitelist": capability_service.list_whitelist(),
+        "toolPolicy": tool_policy_service.snapshot(),
     }
 
 
@@ -270,6 +488,18 @@ async def set_capability_whitelist(payload: CapabilityWhitelistIn) -> dict[str, 
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["message"])
     return {"status": "success", "skillId": payload.skill_id, "enabled": result["whitelisted"]}
+
+
+@router.post("/v1/capabilities/tools/policy")
+async def set_tool_policy(payload: ToolPolicyIn) -> dict[str, Any]:
+    if not tool_registry.has_tool(payload.tool_id):
+        raise HTTPException(status_code=404, detail="tool not found")
+    result = tool_policy_service.set_policy(
+        payload.tool_id,
+        allowlisted=payload.allowlisted,
+        denylisted=payload.denylisted,
+    )
+    return {"status": "success", **result}
 
 
 @router.get("/v1/capabilities/online-search")
@@ -426,7 +656,6 @@ async def execute_unified_stream(payload: UnifiedRequest):
         if slugs:
             query += "\n\n[User-approved ClawHub skills]\n" + "\n".join(f"- {s}" for s in slugs)
     strategy = _get_strategy(payload)
-    llm_config = _get_llm_config(payload)
 
     default_mode = strategy
     if isinstance(execution_plan, dict):
@@ -442,21 +671,20 @@ async def execute_unified_stream(payload: UnifiedRequest):
         step_overrides=step_overrides if isinstance(step_overrides, dict) else None,
     )
 
-    trace_id = f"trace_{uuid4().hex[:12]}"
-    policy = policy_engine
+    otie_request = _build_otie_request(payload, query)
+    intent = otie_intent_service.normalize(otie_request)
+    plan = (
+        _build_otie_plan_from_steps(
+            request_id=payload.request_id,
+            intent_id=intent.intent_id,
+            default_mode=default_mode,
+            steps=steps,
+        )
+        if steps
+        else await otie_planner.build_plan(intent)
+    )
 
     async def event_stream():
-        yield f"data: {json.dumps({'type': 'trace', 'traceId': trace_id}, ensure_ascii=False)}\n\n"
-        trace_store.append(
-            trace_id,
-            {
-                "type": "execution_start",
-                "requestId": payload.request_id,
-                "tenantId": payload.tenant_id,
-                "stepCount": len(steps),
-            },
-        )
-
         if isinstance(confirmed_skills, list):
             for skill_id in [str(x).strip() for x in confirmed_skills if str(x).strip()]:
                 yield f"data: {json.dumps({'type': 'skill_start', 'skill': skill_id}, ensure_ascii=False)}\n\n"
@@ -469,124 +697,30 @@ async def execute_unified_stream(payload: UnifiedRequest):
             )
             for evt in install_events:
                 yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-
-        if not steps:
-            trace_store.append(trace_id, {"type": "note", "message": "no_structured_steps_single_orchestrator"})
-            async for evt in run_orchestrator_stream(query, strategy=strategy, llm_config=llm_config):
-                if evt.get("type") == "done":
-                    trace_store.append(trace_id, {"type": "execution_done", "mode": evt.get("mode"), "answerPreview": str(evt.get("answer", ""))[:500]})
-                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'trace_summary', 'trace': {'total': 0, 'success': 0, 'failed': 0}}, ensure_ascii=False)}\n\n"
-            return
-
-        step_stats = {"total": len(steps), "success": 0, "failed": 0}
-        prior_summary = ""
-        combined: list[str] = []
-
-        for idx, step in enumerate(steps):
-            step_id = str(step["id"])
-            action = str(step["action"])
-            step_skills = step.get("skills") or []
-            skill_ids_for_policy = [str(s) for s in step_skills if str(s).strip()]
-
-            yield f"data: {json.dumps({'type': 'step_start', 'stepId': step_id, 'stepIndex': idx, 'step': action, 'agent': step.get('agent'), 'skills': step_skills}, ensure_ascii=False)}\n\n"
-
-            assessment = policy.assess_step(action, tool_ids=skill_ids_for_policy)
-            allow = policy.is_step_allowed(assessment, step_id, step_approvals if isinstance(step_approvals, dict) else None)
-            yield f"data: {json.dumps({'type': 'policy_check', 'stepId': step_id, 'stepIndex': idx, 'riskLevel': assessment.get('riskLevel'), 'allow': allow, 'deniedTool': assessment.get('deniedTool')}, ensure_ascii=False)}\n\n"
-
-            if not allow:
-                step_stats["failed"] += 1
-                trace_store.append(
-                    trace_id,
-                    {
-                        "type": "blocked",
-                        "stepId": step_id,
-                        "deniedTool": assessment.get("deniedTool"),
-                        "riskLevel": assessment.get("riskLevel"),
-                    },
-                )
-                if assessment.get("deniedTool"):
-                    msg = f"策略拒绝：工具 `{assessment.get('deniedTool')}` 不在允许列表。"
-                    yield f"data: {json.dumps({'type': 'step_done', 'stepId': step_id, 'stepIndex': idx, 'step': action, 'status': 'failed'}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'type': 'done', 'mode': strategy, 'answer': msg, 'blocked': False}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'type': 'trace_summary', 'trace': step_stats}, ensure_ascii=False)}\n\n"
-                    return
-                yield f"data: {json.dumps({'type': 'approval_required', 'stepId': step_id, 'stepIndex': idx, 'reason': 'high-risk action detected', 'decision': 'pending'}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'mode': strategy, 'answer': '执行已暂停：检测到高风险步骤，等待用户审批后继续。', 'blocked': True, 'pendingApprovalStepId': step_id}, ensure_ascii=False)}\n\n"
-                return
-
-            if (
-                assessment.get("riskLevel") == "high"
-                and isinstance(step_approvals, dict)
-                and step_approvals.get(step_id)
-            ):
-                approval_store.append(
-                    trace_id=trace_id,
-                    request_id=payload.request_id,
-                    tenant_id=payload.tenant_id,
-                    step_id=step_id,
-                    approved=True,
-                    meta={"reason": "risk_high"},
-                )
-
-            for sk in skill_ids_for_policy:
-                yield f"data: {json.dumps({'type': 'skill_start', 'skill': sk, 'stepId': step_id}, ensure_ascii=False)}\n\n"
-                result = skill_executor_service.execute(sk, query)
-                out = {**result, "stepId": step_id}
-                yield f"data: {json.dumps({'type': 'skill_result', **out}, ensure_ascii=False)}\n\n"
-
-            step_strat = _coerce_step_strategy(str(step.get("agent") or default_mode), strategy)
-            step_answer = ""
-            async for evt in run_orchestrator_stream_for_step(
-                query,
-                action,
-                idx,
-                len(steps),
-                prior_summary,
-                strategy=step_strat,
-                llm_config=llm_config,
-            ):
-                if evt.get("type") == "done":
-                    step_answer = str(evt.get("answer", ""))
-                else:
-                    yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-
-            output_schema = step.get("outputSchema")
-            schema_mode = str((payload.inputs or {}).get("schemaValidationMode") or "warn").lower()
-            if output_schema and isinstance(output_schema, dict) and schema_mode != "off":
-                vr = validate_llm_text_against_schema(step_answer, output_schema)
-                metrics_service.record_schema(ok=vr.ok)
-                yield f"data: {json.dumps({'type': 'schema_check', 'stepId': step_id, 'stepIndex': idx, 'ok': vr.ok, 'error': vr.error}, ensure_ascii=False)}\n\n"
-                trace_store.append(
-                    trace_id,
-                    {"type": "schema_check", "stepId": step_id, "ok": vr.ok, "error": vr.error},
-                )
-                if not vr.ok and schema_mode == "block":
-                    step_stats["failed"] += 1
-                    msg = f"步骤 {step_id} 输出未通过 JSON Schema：{vr.error or 'validation failed'}"
-                    yield f"data: {json.dumps({'type': 'step_done', 'stepId': step_id, 'stepIndex': idx, 'step': action, 'status': 'failed'}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'type': 'done', 'mode': strategy, 'answer': msg, 'blocked': False}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'type': 'trace_summary', 'trace': step_stats}, ensure_ascii=False)}\n\n"
-                    return
-                if not vr.ok and schema_mode == "warn":
-                    step_answer = f"{step_answer}\n\n[schema warning] {vr.error}"
-
-            trace_store.append(
-                trace_id,
-                {"type": "step_llm_done", "stepId": step_id, "answerPreview": step_answer[:500]},
-            )
-            combined.append(f"### {step_id}\n{step_answer}")
-            prior_summary = (prior_summary + f"\n{step_id}: {step_answer}")[-4000:]
-
-            step_stats["success"] += 1
-            yield f"data: {json.dumps({'type': 'step_done', 'stepId': step_id, 'stepIndex': idx, 'step': action, 'status': 'success'}, ensure_ascii=False)}\n\n"
-            trace_store.append(trace_id, {"type": "step_completed", "stepId": step_id, "status": "success"})
-
-        final_answer = "\n\n".join(combined)
-        yield f"data: {json.dumps({'type': 'done', 'mode': strategy, 'answer': final_answer, 'latencyMs': 0}, ensure_ascii=False)}\n\n"
-        trace_store.append(trace_id, {"type": "execution_finished", "answerPreview": final_answer[:500]})
-        yield f"data: {json.dumps({'type': 'trace_summary', 'trace': step_stats}, ensure_ascii=False)}\n\n"
+        result = await otie_runtime.run(
+            intent,
+            plan,
+            step_approvals=step_approvals if isinstance(step_approvals, dict) else {},
+        )
+        yield f"data: {json.dumps({'type': 'trace', 'traceId': result.trace_id}, ensure_ascii=False)}\n\n"
+        success_count = 0
+        failed_count = 0
+        for event in result.events:
+            event_type = str(event.get("type") or "")
+            if event_type == "step_completed":
+                success_count += 1
+            if event_type == "run_finished" and str(event.get("status")) in {"failed", "awaiting_approval"}:
+                failed_count += 1
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        if result.status == "awaiting_approval":
+            pending_step = ""
+            for event in result.events:
+                if event.get("type") == "state_transition" and event.get("toState") == "awaiting_approval":
+                    pending_step = str(event.get("stepId") or "")
+                    break
+            yield f"data: {json.dumps({'type': 'approval_required', 'stepId': pending_step, 'decision': 'pending'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'mode': plan.mode, 'answer': result.final_answer, 'blocked': result.status == 'awaiting_approval'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'trace_summary', 'trace': {'total': len(plan.steps), 'success': success_count, 'failed': failed_count}, 'runId': result.run_id}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

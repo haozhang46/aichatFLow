@@ -7,6 +7,7 @@ type ChatRole = "user" | "assistant";
 type ChatMessage = {
   role: ChatRole;
   content: string;
+  traceId?: string;
 };
 
 type Props = {
@@ -16,6 +17,12 @@ type Props = {
   input: string;
   onInputChange: (value: string) => void;
   onSend: () => void | Promise<void>;
+  canStop: boolean;
+  onStop: () => void;
+  canResume: boolean;
+  onResume: () => void | Promise<void>;
+  resumeLabel?: string | null;
+  onOpenTrace: (traceId: string) => void | Promise<void>;
 };
 
 export default function ChatPanel(props: Props) {
@@ -23,7 +30,7 @@ export default function ChatPanel(props: Props) {
 
   return (
     <>
-      <section className="flex-1 border border-zinc-200 dark:border-zinc-800 rounded bg-white dark:bg-zinc-900 p-4 overflow-auto min-h-[320px] max-h-[calc(100vh-320px)]">
+      <section className="border border-zinc-200 dark:border-zinc-800 rounded bg-white dark:bg-zinc-900 p-4 overflow-auto h-[calc(100vh-200px)]">
         {props.messages.length === 0 ? (
           <div className="text-zinc-500">输入问题开始聊天。默认 strategy=auto。</div>
         ) : (
@@ -38,6 +45,15 @@ export default function ChatPanel(props: Props) {
                 >
                   <div className="text-xs text-zinc-600 dark:text-zinc-400 mb-1">{m.role}</div>
                   <div>{m.content}</div>
+                  {m.traceId ? (
+                    <button
+                      type="button"
+                      className="mt-2 text-[11px] font-mono text-indigo-600 dark:text-indigo-400 underline underline-offset-2"
+                      onClick={() => void props.onOpenTrace(m.traceId!)}
+                    >
+                      traceId: {m.traceId}
+                    </button>
+                  ) : null}
                 </div>
               </div>
             ))}
@@ -63,6 +79,18 @@ export default function ChatPanel(props: Props) {
         />
         <AppButton type="submit" size="md" variant="primary" disabled={!canSend}>
           Send
+        </AppButton>
+        <AppButton type="button" size="md" variant="danger" disabled={!props.canStop} onClick={props.onStop}>
+          Stop
+        </AppButton>
+        <AppButton
+          type="button"
+          size="md"
+          variant="info"
+          disabled={!props.canResume || props.loading}
+          onClick={() => void props.onResume()}
+        >
+          {props.resumeLabel ? `Resume ${props.resumeLabel}` : "Resume"}
         </AppButton>
       </form>
     </>

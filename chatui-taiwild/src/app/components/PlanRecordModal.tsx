@@ -17,6 +17,7 @@ type Props = {
     source: { title: string; mode: Strategy; lines: string[]; skills: string[] },
     editable: boolean
   ) => void;
+  openTrace: (traceId: string, requestId?: string) => void | Promise<void>;
   toggleFavorite: (itemId: string) => void;
   deletePlanItem: (itemId: string) => void;
 };
@@ -78,6 +79,16 @@ export default function PlanRecordModal(props: Props) {
               <AppButton type="button" onClick={() => void props.executePlanItem(item)} size="xs" variant="success">
                 使用计划
               </AppButton>
+              {item.lastTraceId ? (
+                <AppButton
+                  type="button"
+                  onClick={() => void props.openTrace(item.lastTraceId!, item.requestId)}
+                  size="xs"
+                  variant="info"
+                >
+                  查看 Trace
+                </AppButton>
+              ) : null}
               <AppButton
                 type="button"
                 onClick={() =>

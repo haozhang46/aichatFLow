@@ -50,7 +50,7 @@ export type PlanHistoryItem = {
   executionMode?: "auto_exec" | "user_exec";
   planBranches?: Record<number, PlanBranchNode[]>;
   selectedPlanBranch?: Record<number, Record<string, string>>;
-  stepExecutionConfigs?: Record<number, { agent: string; skills: string[] }>;
+  stepExecutionConfigs?: Record<number, { agent: string; skills: string[]; tools?: string[] }>;
   clawhubSuggestions?: ClawhubPlanSuggestion[];
   executionPlan?: ExecutionPlan;
   lastTraceId?: string;
@@ -81,9 +81,25 @@ export type CapabilitySkill = {
   };
 };
 
+export type CapabilityTool = {
+  id: string;
+  name: string;
+  description: string;
+  category?: string;
+  builtin?: boolean;
+  allowlisted?: boolean;
+  denylisted?: boolean;
+};
+
 export type DeepSeekConfig = {
   enabled: boolean;
   apiKey: string;
   baseUrl: string;
   model: string;
+};
+
+export type RagConfig = {
+  enabled: boolean;
+  scope: string;
+  topK: number;
 };

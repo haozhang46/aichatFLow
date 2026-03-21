@@ -85,6 +85,39 @@ def test_save_plan_record_to_specs_plan_folder():
     assert "/specs/main/plans/" in body["path"]
 
 
+def test_plan_reuses_existing_plan_record_for_identical_query():
+    client = TestClient(app)
+    save = client.post(
+        "/v1/plan-records/save",
+        json={
+            "query": "复用计划测试",
+            "intentDescription": "复用已有计划记录",
+            "mode": "agent",
+            "planLines": ["步骤A", "步骤B"],
+            "recommendedSkills": ["find-skills"],
+            "supplement": "",
+        },
+    )
+    assert save.status_code == 200
+
+    resp = client.post(
+        "/v1/unified/plan",
+        json={
+            "requestId": "req-plan-reuse-1",
+            "tenantId": "tenant-a",
+            "requestType": "chat",
+            "messages": [{"role": "user", "content": "复用计划测试"}],
+            "inputs": {"strategy": "auto"},
+        },
+    )
+    assert resp.status_code == 200
+    output = resp.json()["output"]
+    assert output["reusedFromPlanRecord"] is True
+    assert output["plan"] == ["步骤A", "步骤B"]
+    assert output["intentDescription"] == "复用已有计划记录"
+    assert output["planRecordPath"]
+
+
 def test_capability_install_and_whitelist_update():
     client = TestClient(app)
     wl = client.post("/v1/capabilities/whitelist", json={"skillId": "find-skills", "enabled": True})

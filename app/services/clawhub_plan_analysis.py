@@ -10,9 +10,14 @@ import json
 import logging
 from typing import Any, Optional
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage
+    from langchain_core.prompts import ChatPromptTemplate
+except ImportError:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore[assignment]
+    SystemMessage = None  # type: ignore[assignment]
+    ChatPromptTemplate = None  # type: ignore[assignment]
 
 from app.core.config import settings
 from app.services.clawhub_service import search_skills
@@ -90,6 +95,8 @@ def _heuristic_risk(slug: str, display_name: str, summary: str) -> dict[str, str
 
 
 def _llm_available(llm_config: Optional[dict[str, str]]) -> bool:
+    if ChatOpenAI is None or ChatPromptTemplate is None or SystemMessage is None:
+        return False
     if llm_config and str(llm_config.get("apiKey", "")).strip():
         return True
     return bool(settings.openai_api_key and settings.openai_api_key.strip())

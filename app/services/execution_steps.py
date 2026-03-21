@@ -11,6 +11,12 @@ def _safe_list_skills(raw: Any) -> list[str]:
     return [str(x).strip() for x in raw if str(x).strip()]
 
 
+def _safe_list_tools(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
 def _execution_map(step_executions: Optional[list[Any]]) -> dict[int, dict[str, Any]]:
     m: dict[int, dict[str, Any]] = {}
     if not isinstance(step_executions, list):
@@ -34,7 +40,7 @@ def normalize_execution_steps(
 ) -> list[dict[str, Any]]:
     """
     Returns ordered steps:
-    { id, type, action, agent, skills, dependsOn, retryPolicy, timeoutMs }
+    { id, type, action, agent, skills, tools, dependsOn, retryPolicy, timeoutMs }
     """
     step_overrides = step_overrides or {}
     ex_map = _execution_map(step_executions)
@@ -80,6 +86,7 @@ def normalize_execution_steps(
             depends = []
         agent = str(item.get("agent") or default_mode).strip() or default_mode
         skills = _safe_list_skills(item.get("skills"))
+        tools = _safe_list_tools(item.get("tools"))
 
         merged = ex_map.get(idx)
         if isinstance(merged, dict):
@@ -88,6 +95,8 @@ def normalize_execution_steps(
                 agent = ma.strip()
             ms = merged.get("skills")
             skills = _safe_list_skills(ms) if ms is not None else skills
+            mt = merged.get("tools")
+            tools = _safe_list_tools(mt) if mt is not None else tools
 
         retry = item.get("retryPolicy")
         if not isinstance(retry, dict):
@@ -107,6 +116,7 @@ def normalize_execution_steps(
                 "dependsOn": depends,
                 "agent": agent,
                 "skills": skills,
+                "tools": tools,
                 "retryPolicy": retry,
                 "timeoutMs": timeout_ms,
                 "outputSchema": output_schema,
