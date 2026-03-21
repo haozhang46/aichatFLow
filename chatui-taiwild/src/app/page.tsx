@@ -1,0 +1,2475 @@
+"use client";
+
+import { useEffect, useMemo, useState, type ReactElement } from "react";
+import {
+  type Edge,
+  type Node,
+  addEdge,
+  useEdgesState,
+  useNodesState,
+  type Connection,
+} from "@xyflow/react";
+import TaskFlowModal from "@/components/TaskFlowModal";
+import ChatPanel from "@/components/chat/ChatPanel";
+import AppButton from "@/components/ui/AppButton";
+import CapabilityModal from "@/app/components/CapabilityModal";
+import DeepseekModal from "@/app/components/DeepseekModal";
+import PlanRecordModal from "@/app/components/PlanRecordModal";
+import PlanDetailModal from "@/app/components/PlanDetailModal";
+import type {
+  Strategy,
+  PlanHistoryItem,
+  PlanBranchNode,
+  ExecutionPlan,
+  ExecutionPlanStep,
+  ClawhubPlanSuggestion,
+} from "@/app/components/modalTypes";
+
+type ChatRole = "user" | "assistant";
+
+type ChatMessage = {
+  role: ChatRole;
+  content: string;
+};
+
+type ExecutionMode = "auto_exec" | "user_exec";
+
+type PendingPlan = {
+  requestId: string;
+  query: string;
+  mode: Strategy;
+  intentDescription: string;
+  thinking: string;
+  searchEvidence: Array<{ title: string; url: string }>;
+  lines: string[];
+  recommendedSkills: string[];
+  missingSkills: string[];
+  installRequired: boolean;
+  requiredSkills: string[];
+  taskChecklist: ExecutionChecklistItem[];
+  executionMode: ExecutionMode;
+  clawhubSuggestions?: ClawhubPlanSuggestion[];
+  executionPlan?: ExecutionPlan;
+};
+
+type CapabilityAgent = {
+  id: string;
+  label: string;
+  description: string;
+  source?: string;
+};
+
+type CapabilitySkill = {
+  id: string;
+  name: string;
+  source: string;
+  installed: boolean;
+  whitelisted?: boolean;
+  manifest?: {
+    toolId: string;
+    riskLevel?: string;
+    source?: string;
+    permissions?: string[];
+    inputSchema?: Record<string, unknown>;
+    outputSchema?: Record<string, unknown>;
+  };
+};
+
+type FlowSource = {
+  title: string;
+  mode: Strategy;
+  lines: string[];
+  skills: string[];
+};
+
+type FolderAuthorization = {
+  path: string;
+  permission: string;
+};
+
+type StepExecutionConfig = {
+  agent: string;
+  skills: string[];
+};
+
+type ExecutionChecklistItem = {
+  id: string;
+  text: string;
+  done: boolean;
+};
+
+type StepRunState = "pending" | "running" | "success" | "failed";
+
+type DeepSeekConfig = {
+  enabled: boolean;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+};
+
+const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:3000";
+const PLAN_HISTORY_KEY = "aichatflow.planHistory.v1";
+const PLAN_EXPANDED_KEY = "aichatflow.planExpanded.v1";
+const DEEPSEEK_CONFIG_KEY = "aichatflow.deepseek.config.v1";
+
+function newRequestId() {
+  return `req_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function normalizeClawhubSuggestions(raw: unknown): ClawhubPlanSuggestion[] {
+  if (!Array.isArray(raw)) return [];
+  const levels = new Set(["low", "medium", "high"]);
+  const recs = new Set(["adopt", "review", "avoid"]);
+  const out: ClawhubPlanSuggestion[] = [];
+  for (const x of raw) {
+    if (!x || typeof x !== "object") continue;
+    const o = x as Record<string, unknown>;
+    const slug = String(o.slug ?? "").trim();
+    if (!slug) continue;
+    const rl = String(o.riskLevel ?? "low");
+    const rc = String(o.recommendation ?? "review");
+    const item: ClawhubPlanSuggestion = {
+      slug,
+      name: String(o.name ?? slug),
+      summary: String(o.summary ?? ""),
+      riskLevel: (levels.has(rl) ? rl : "low") as ClawhubPlanSuggestion["riskLevel"],
+      recommendation: (recs.has(rc) ? rc : "review") as ClawhubPlanSuggestion["recommendation"],
+      analysis: String(o.analysis ?? ""),
+      userSelected: Boolean(o.userSelected),
+    };
+    if (typeof o.score === "number") item.score = o.score;
+    out.push(item);
+  }
+  return out;
+}
+
+function normalizeExecutionPlan(raw: unknown, fallbackLines: string[], mode: Strategy): ExecutionPlan {
+  const fallback: ExecutionPlan = {
+    planId: `plan_local_${Date.now()}`,
+    mode,
+    steps: fallbackLines
+      .filter((x) => x.trim().length > 0)
+      .map((line, idx) => ({
+        id: `s${idx + 1}`,
+        type: "llm",
+        action: line,
+        input: { text: line },
+        dependsOn: idx > 0 ? [`s${idx}`] : [],
+        agent: mode,
+        skills: [],
+      })),
+  };
+  if (!raw || typeof raw !== "object") return fallback;
+  const o = raw as Record<string, unknown>;
+  const modeRaw = String(o.mode ?? mode);
+  const validMode: Strategy = ["auto", "agent", "react", "workflow"].includes(modeRaw)
+    ? (modeRaw as Strategy)
+    : mode;
+  const rawSteps = Array.isArray(o.steps) ? o.steps : [];
+  const steps: ExecutionPlanStep[] = rawSteps.flatMap((x, idx) => {
+    if (!x || typeof x !== "object") return [];
+    const s = x as Record<string, unknown>;
+    const action = String(s.action ?? "").trim();
+    if (!action) return [];
+    const step: ExecutionPlanStep = {
+      id: String(s.id ?? `s${idx + 1}`),
+      type: String(s.type ?? "llm"),
+      action,
+      input: s.input && typeof s.input === "object" ? (s.input as Record<string, unknown>) : undefined,
+      dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.map((d) => String(d)) : undefined,
+      agent: s.agent ? String(s.agent) : undefined,
+      skills: Array.isArray(s.skills) ? s.skills.map((k) => String(k)) : undefined,
+      outputSchema:
+        s.outputSchema && typeof s.outputSchema === "object"
+          ? (s.outputSchema as Record<string, unknown>)
+          : undefined,
+    };
+    return [step];
+  });
+  return {
+    planId: String(o.planId ?? `plan_local_${Date.now()}`),
+    mode: validMode,
+    steps: steps.length > 0 ? steps : fallback.steps,
+  };
+}
+
+export default function Home() {
+  const [tenantId, setTenantId] = useState("tenant-a");
+  const [strategy, setStrategy] = useState<Strategy>("auto");
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
+  const [planSupplement, setPlanSupplement] = useState("");
+  const [planBranches, setPlanBranches] = useState<Record<number, PlanBranchNode[]>>({});
+  const [selectedPlanBranch, setSelectedPlanBranch] = useState<Record<number, Record<string, string>>>({});
+  const [planBranchInput, setPlanBranchInput] = useState<Record<string, string>>({});
+  const [stepExecutionConfigs, setStepExecutionConfigs] = useState<Record<number, StepExecutionConfig>>({});
+  const [executionChecklist, setExecutionChecklist] = useState<ExecutionChecklistItem[]>([]);
+  const [executionStepStates, setExecutionStepStates] = useState<Record<string, StepRunState>>({});
+  const [stepApprovals, setStepApprovals] = useState<Record<string, boolean>>({});
+  const [pendingApprovalStepId, setPendingApprovalStepId] = useState<string | null>(null);
+  const [activeTraceId, setActiveTraceId] = useState<string | null>(null);
+  const [planFolderAuths, setPlanFolderAuths] = useState<FolderAuthorization[]>([]);
+  const [planFolderPathInput, setPlanFolderPathInput] = useState("");
+  const [planFolderPermInput, setPlanFolderPermInput] = useState("777");
+  const [planHistory, setPlanHistory] = useState<PlanHistoryItem[]>([]);
+  const [expandedCategories, setExpandedCategories] = useState<Record<Strategy, boolean>>({
+    auto: true,
+    agent: true,
+    react: true,
+    workflow: true,
+  });
+  const [autoInstallMissing, setAutoInstallMissing] = useState(true);
+  const [confirmedSkills, setConfirmedSkills] = useState<string[]>([]);
+  const [capabilityOpen, setCapabilityOpen] = useState(false);
+  const [capabilityTab, setCapabilityTab] = useState<"existing" | "add">("existing");
+  const [capabilityQuery, setCapabilityQuery] = useState("");
+  const [capabilityAgents, setCapabilityAgents] = useState<CapabilityAgent[]>([]);
+  const [capabilitySkills, setCapabilitySkills] = useState<CapabilitySkill[]>([]);
+  const [capabilityWhitelist, setCapabilityWhitelist] = useState<string[]>([]);
+  const [personalSkillRootPath, setPersonalSkillRootPath] = useState("");
+  const [personalSkillPathInput, setPersonalSkillPathInput] = useState("");
+  const [personalSkillItems, setPersonalSkillItems] = useState<Array<{ type: "dir" | "md"; path: string }>>([]);
+  const [capabilityPage, setCapabilityPage] = useState(1);
+  const [capabilityPageSize] = useState(8);
+  const [capabilitySkillsTotal, setCapabilitySkillsTotal] = useState(0);
+  const [onlineQuery, setOnlineQuery] = useState("");
+  const [onlineSkills, setOnlineSkills] = useState<CapabilitySkill[]>([]);
+  const [customAgents, setCustomAgents] = useState<CapabilityAgent[]>([]);
+  const [newAgentId, setNewAgentId] = useState("");
+  const [newAgentLabel, setNewAgentLabel] = useState("");
+  const [newAgentDescription, setNewAgentDescription] = useState("");
+  const [flowOpen, setFlowOpen] = useState(false);
+  const [flowEditable, setFlowEditable] = useState(true);
+  const [flowTitle, setFlowTitle] = useState("");
+  const [flowNodes, setFlowNodes, onFlowNodesChange] = useNodesState<Node>([]);
+  const [flowEdges, setFlowEdges, onFlowEdgesChange] = useEdgesState<Edge>([]);
+  const [flowSkills, setFlowSkills] = useState<string[]>([]);
+  const [flowSkillInput, setFlowSkillInput] = useState("");
+  const [flowFolderAuths, setFlowFolderAuths] = useState<FolderAuthorization[]>([]);
+  const [flowFolderPathInput, setFlowFolderPathInput] = useState("");
+  const [flowFolderPermInput, setFlowFolderPermInput] = useState("777");
+  const [planRecordOpen, setPlanRecordOpen] = useState(false);
+  const [planRecordSearch, setPlanRecordSearch] = useState("");
+  const [selectedPlanRecord, setSelectedPlanRecord] = useState<PlanHistoryItem | null>(null);
+  const [deepseekOpen, setDeepseekOpen] = useState(false);
+  const [deepseekConfig, setDeepseekConfig] = useState<DeepSeekConfig>({
+    enabled: false,
+    apiKey: "",
+    baseUrl: "https://api.deepseek.com/v1",
+    model: "deepseek-chat",
+  });
+
+  function newChat() {
+    setMessages([]);
+    setPendingPlan(null);
+    setPlanSupplement("");
+    setPlanBranches({});
+    setSelectedPlanBranch({});
+    setPlanBranchInput({});
+    setStepExecutionConfigs({});
+    setExecutionChecklist([]);
+    setExecutionStepStates({});
+    setStepApprovals({});
+    setPendingApprovalStepId(null);
+    setInput("");
+    setError(null);
+    setConfirmedSkills([]);
+    setPlanFolderAuths([]);
+    setPlanFolderPathInput("");
+    setPlanFolderPermInput("777");
+  }
+
+  useEffect(() => {
+    try {
+      const historyRaw = window.localStorage.getItem(PLAN_HISTORY_KEY);
+      const expandedRaw = window.localStorage.getItem(PLAN_EXPANDED_KEY);
+      if (historyRaw) {
+        const parsed = JSON.parse(historyRaw) as Partial<PlanHistoryItem>[];
+        if (Array.isArray(parsed)) {
+          setPlanHistory(
+            parsed.map((item) => ({
+              id: item.id ?? `${item.requestId ?? "legacy"}_${Date.now()}`,
+              requestId: item.requestId ?? "legacy",
+              query: item.query ?? "未命名提问",
+              intentDescription: item.intentDescription ?? `用户希望解决：${item.query ?? "未命名提问"}`,
+              mode: (item.mode ?? "auto") as Strategy,
+              lines: Array.isArray(item.lines) ? item.lines : [],
+              recommendedSkills: Array.isArray(item.recommendedSkills) ? item.recommendedSkills : [],
+              supplement: item.supplement ?? "",
+              savedPath: item.savedPath,
+              favorite: Boolean(item.favorite),
+              createdAt: item.createdAt ?? new Date().toISOString(),
+              executionMode:
+                item.executionMode === "user_exec" || item.executionMode === "auto_exec"
+                  ? item.executionMode
+                  : "auto_exec",
+              planBranches:
+                item.planBranches && typeof item.planBranches === "object"
+                  ? item.planBranches
+                  : {},
+              selectedPlanBranch:
+                item.selectedPlanBranch && typeof item.selectedPlanBranch === "object"
+                  ? item.selectedPlanBranch
+                  : {},
+              stepExecutionConfigs:
+                item.stepExecutionConfigs && typeof item.stepExecutionConfigs === "object"
+                  ? item.stepExecutionConfigs
+                  : {},
+              taskChecklist: Array.isArray(item.taskChecklist)
+                ? item.taskChecklist
+                    .map((x) => {
+                      const itemX = x as { id?: string; text?: string; done?: boolean };
+                      return {
+                        id: String(itemX?.id ?? `legacy_${Math.random().toString(16).slice(2)}`),
+                        text: String(itemX?.text ?? ""),
+                        done: Boolean(itemX?.done),
+                      };
+                    })
+                    .filter((x) => x.text.trim().length > 0)
+                : [],
+              clawhubSuggestions: normalizeClawhubSuggestions(item.clawhubSuggestions),
+              executionPlan: normalizeExecutionPlan(item.executionPlan, item.lines ?? [], (item.mode ?? "auto") as Strategy),
+            }))
+          );
+        }
+      }
+      if (expandedRaw) {
+        const parsed = JSON.parse(expandedRaw) as Record<Strategy, boolean>;
+        if (parsed && typeof parsed === "object") {
+          setExpandedCategories((prev) => ({ ...prev, ...parsed }));
+        }
+      }
+    } catch {
+      // Ignore malformed local storage values.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(DEEPSEEK_CONFIG_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Partial<DeepSeekConfig>;
+      setDeepseekConfig((prev) => ({
+        ...prev,
+        enabled: Boolean(parsed.enabled),
+        apiKey: parsed.apiKey ?? prev.apiKey,
+        baseUrl: parsed.baseUrl ?? prev.baseUrl,
+        model: parsed.model ?? prev.model,
+      }));
+    } catch {
+      // Ignore malformed deepseek config.
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(PLAN_HISTORY_KEY, JSON.stringify(planHistory));
+  }, [planHistory]);
+
+  useEffect(() => {
+    window.localStorage.setItem(PLAN_EXPANDED_KEY, JSON.stringify(expandedCategories));
+  }, [expandedCategories]);
+
+  useEffect(() => {
+    window.localStorage.setItem(DEEPSEEK_CONFIG_KEY, JSON.stringify(deepseekConfig));
+  }, [deepseekConfig]);
+
+  useEffect(() => {
+    if (!pendingPlan || loading) return;
+    const normalizedLines = pendingPlan.lines.map((x) => x.trim()).filter((x) => x.length > 0);
+    if (normalizedLines.length === 0) return;
+    const ready = normalizedLines.length === pendingPlan.lines.length;
+    if (!ready) return;
+    if ((pendingPlan.taskChecklist ?? []).length > 0) return;
+    const seededChecklist: ExecutionChecklistItem[] = normalizedLines.map((line, idx) => ({
+      id: `task_${pendingPlan.requestId}_${idx}`,
+      text: line,
+      done: false,
+    }));
+    setPendingPlan((prev) => {
+      if (!prev) return prev;
+      return { ...prev, taskChecklist: seededChecklist };
+    });
+    setPlanHistory((prev) =>
+      prev.map((item) =>
+        item.requestId === pendingPlan.requestId ? { ...item, taskChecklist: seededChecklist } : item
+      )
+    );
+  }, [pendingPlan, loading]);
+
+  async function loadCapabilities(keyword = "", page = 1) {
+    const qPart = keyword ? `q=${encodeURIComponent(keyword)}&` : "";
+    const qs = `?${qPart}page=${page}&pageSize=${capabilityPageSize}`;
+    const res = await fetch(`${apiBaseUrl}/v1/capabilities${qs}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.detail ?? "load capabilities failed");
+    setCapabilityAgents(Array.isArray(data?.agents) ? data.agents : []);
+    setCapabilitySkills(Array.isArray(data?.skills) ? data.skills : []);
+    setCapabilityWhitelist(Array.isArray(data?.whitelist) ? data.whitelist.map((x: unknown) => String(x)) : []);
+    setCapabilitySkillsTotal(Number(data?.skillsTotal ?? 0));
+    setCapabilityPage(Number(data?.page ?? page));
+  }
+
+  async function loadCustomAgents() {
+    const res = await fetch(`${apiBaseUrl}/v1/agents`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.detail ?? "load custom agents failed");
+    setCustomAgents(Array.isArray(data?.items) ? data.items : []);
+  }
+
+  async function loadPersonalSkillTree() {
+    const res = await fetch(`${apiBaseUrl}/v1/personal-skills/tree`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.detail ?? "load personal skill tree failed");
+    }
+    const rootPath = typeof data?.rootPath === "string" ? data.rootPath : "";
+    const items = Array.isArray(data?.items)
+      ? data.items
+          .map((x: unknown) => {
+            const item = x as { type?: string; path?: string };
+            return {
+              type: item?.type === "dir" ? "dir" : ("md" as "dir" | "md"),
+              path: String(item?.path ?? ""),
+            };
+          })
+          .filter((x: { path: string }) => x.path.length > 0)
+      : [];
+    setPersonalSkillRootPath(rootPath);
+    setPersonalSkillPathInput(rootPath || personalSkillPathInput);
+    setPersonalSkillItems(items);
+  }
+
+  async function savePersonalSkillPath() {
+    const path = personalSkillPathInput.trim();
+    if (!path) return;
+    const res = await fetch(`${apiBaseUrl}/v1/personal-skills/path`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "save personal skill path failed");
+      return;
+    }
+    setPersonalSkillRootPath(typeof data?.rootPath === "string" ? data.rootPath : path);
+    setPersonalSkillItems(Array.isArray(data?.items) ? data.items : []);
+    setMessages((prev) => [...prev, { role: "assistant", content: "个人技能树路径已更新。" }]);
+  }
+
+  async function pickPersonalSkillPath() {
+    const picker = (window as Window & { showDirectoryPicker?: () => Promise<{ name?: string }> }).showDirectoryPicker;
+    if (!picker) return;
+    try {
+      const handle = await picker();
+      if (handle?.name) {
+        setPersonalSkillPathInput(handle.name);
+      }
+    } catch {
+      // User canceled directory picker.
+    }
+  }
+
+  async function installSkill(skillId: string) {
+    const res = await fetch(`${apiBaseUrl}/v1/capabilities/install`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skillId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "install failed");
+      return;
+    }
+    setMessages((prev) => [...prev, { role: "assistant", content: data?.message ?? "安装成功" }]);
+    await loadCapabilities(capabilityQuery, capabilityPage);
+  }
+
+  async function toggleWhitelist(skillId: string, enabled: boolean) {
+    const res = await fetch(`${apiBaseUrl}/v1/capabilities/whitelist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skillId, enabled }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "set whitelist failed");
+      return;
+    }
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: `Whitelist updated: ${data?.skillId} -> ${data?.enabled}` },
+    ]);
+    await loadCapabilities(capabilityQuery, capabilityPage);
+  }
+
+  async function searchOnlineSkills() {
+    const res = await fetch(`${apiBaseUrl}/v1/clawhub/search?q=${encodeURIComponent(onlineQuery)}&limit=25`);
+    const data = await res.json();
+    if (!res.ok) {
+      setError(data?.detail ?? "ClawHub search failed");
+      return;
+    }
+    setOnlineSkills(Array.isArray(data?.items) ? data.items : []);
+  }
+
+  async function addOnlineSkill(skillId: string) {
+    const res = await fetch(`${apiBaseUrl}/v1/clawhub/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: skillId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "add online skill failed");
+      return;
+    }
+    setMessages((prev) => [...prev, { role: "assistant", content: data?.message ?? "已加入列表" }]);
+    await loadCapabilities(capabilityQuery, 1);
+  }
+
+  async function createCustomAgent() {
+    const res = await fetch(`${apiBaseUrl}/v1/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agentId: newAgentId,
+        label: newAgentLabel,
+        description: newAgentDescription,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "create agent failed");
+      return;
+    }
+    const created = data?.agent as { id?: string; label?: string; description?: string } | undefined;
+    const createdId = created?.id ?? newAgentId;
+    const createdLabel = created?.label ?? newAgentLabel ?? createdId;
+    const createdDesc = created?.description ?? newAgentDescription ?? "";
+    setNewAgentId("");
+    setNewAgentLabel("");
+    setNewAgentDescription("");
+    await loadCustomAgents();
+    await loadCapabilities(capabilityQuery, capabilityPage);
+    setCapabilityOpen(false);
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content:
+          `已创建自建 Agent: ${createdLabel} (${createdId})\n` +
+          (createdDesc ? `描述: ${createdDesc}\n` : "") +
+          "初始 Plan:\n" +
+          "1. 识别并澄清用户目标\n" +
+          "2. 生成可执行步骤与所需 skill\n" +
+          "3. 等待用户确认后执行\n\n" +
+          "请继续输入你的意图（例如：帮我规划今天上海出行）。",
+      },
+    ]);
+    setInput("");
+  }
+
+  async function deleteCustomAgent(agentId: string) {
+    const res = await fetch(`${apiBaseUrl}/v1/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data?.detail ?? "delete agent failed");
+      return;
+    }
+    if (data?.status === "success") {
+      await loadCustomAgents();
+      await loadCapabilities(capabilityQuery, capabilityPage);
+    }
+  }
+
+  async function sendMessage() {
+    const content = input.trim();
+    setInput("");
+    setError(null);
+
+    const userMsg: ChatMessage = { role: "user", content };
+    setMessages((prev) => [...prev, userMsg]);
+    setLoading(true);
+
+    try {
+      const requestId = newRequestId();
+      const res = await fetch(`${apiBaseUrl}/v1/unified/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requestId,
+          tenantId,
+          requestType: "chat",
+          messages: [{ role: "user", content }],
+          inputs: {
+            strategy,
+            llmConfig:
+              deepseekConfig.enabled && deepseekConfig.apiKey.trim()
+                ? {
+                    provider: "deepseek",
+                    apiKey: deepseekConfig.apiKey.trim(),
+                    baseUrl: deepseekConfig.baseUrl.trim(),
+                    model: deepseekConfig.model.trim(),
+                  }
+                : null,
+          },
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail ?? "Request failed");
+      }
+
+      const mode = (data?.output?.mode ?? "agent") as Strategy;
+      const lines: string[] = Array.isArray(data?.output?.plan)
+        ? (data.output.plan as unknown[]).map((x) => String(x))
+        : [];
+      const recommendedSkills = Array.isArray(data?.output?.recommendedSkills)
+        ? data.output.recommendedSkills
+        : [];
+      const missingSkills = Array.isArray(data?.output?.missingSkills) ? data.output.missingSkills : [];
+      const installRequired = Boolean(data?.output?.installRequired);
+      const requiredSkills = Array.isArray(data?.output?.requiredSkills) ? data.output.requiredSkills : [];
+      const executionMode: ExecutionMode =
+        data?.output?.executionMode === "user_exec" ? "user_exec" : "auto_exec";
+      const intentDescription =
+        typeof data?.output?.intentDescription === "string" && data.output.intentDescription.trim()
+          ? data.output.intentDescription.trim()
+          : `用户希望解决：${content}`;
+      const thinking =
+        typeof data?.output?.thinking === "string" ? data.output.thinking : "";
+      const searchEvidence = Array.isArray(data?.output?.searchEvidence)
+        ? data.output.searchEvidence
+            .map((x: unknown) => {
+              const item = x as { title?: string; url?: string };
+              return {
+                title: String(item?.title ?? "").trim(),
+                url: String(item?.url ?? "").trim(),
+              };
+            })
+            .filter((x: { title: string; url: string }) => x.title && x.url.startsWith("https://"))
+        : [];
+      const clawhubSuggestions = normalizeClawhubSuggestions(data?.output?.clawhubPlanSuggestions);
+      const executionPlan = normalizeExecutionPlan(data?.output?.executionPlan, lines, mode);
+      setPendingPlan({
+        requestId,
+        query: content,
+        mode,
+        intentDescription,
+        thinking,
+        searchEvidence,
+        lines,
+        recommendedSkills,
+        missingSkills,
+        installRequired,
+        requiredSkills,
+        taskChecklist: lines.map((line, idx) => ({
+          id: `task_${requestId}_${idx}`,
+          text: line,
+          done: false,
+        })),
+        executionMode,
+        clawhubSuggestions,
+        executionPlan,
+      });
+      setConfirmedSkills(requiredSkills.length > 0 ? requiredSkills : recommendedSkills);
+      setPlanSupplement("");
+      setPlanBranches({});
+      setSelectedPlanBranch({});
+      setPlanBranchInput({});
+      const initialStepConfigs: Record<number, StepExecutionConfig> = {};
+      lines.forEach((_, idx) => {
+        initialStepConfigs[idx] = {
+          agent: mode,
+          skills: requiredSkills.length > 0 ? [...requiredSkills] : [...recommendedSkills],
+        };
+      });
+      setStepExecutionConfigs(initialStepConfigs);
+      setPlanFolderAuths([]);
+      setPlanFolderPathInput("");
+      setPlanFolderPermInput("777");
+      if (capabilityAgents.length === 0 || capabilitySkills.length === 0) {
+        try {
+          await loadCapabilities("", 1);
+        } catch {
+          // Keep plan panel usable even if capability fetch fails.
+        }
+      }
+      const now = new Date().toISOString();
+      const historyItem: PlanHistoryItem = {
+        id: `${requestId}_${now}`,
+        requestId,
+        query: content,
+        intentDescription,
+        mode,
+        lines,
+        recommendedSkills,
+        supplement: "",
+        favorite: false,
+        createdAt: now,
+        executionMode,
+        planBranches: {},
+        selectedPlanBranch: {},
+        stepExecutionConfigs: initialStepConfigs,
+        taskChecklist: lines.map((line, idx) => ({
+          id: `task_${requestId}_${idx}`,
+          text: line,
+          done: false,
+        })),
+        clawhubSuggestions,
+        executionPlan,
+      };
+      try {
+        const saveRes = await fetch(`${apiBaseUrl}/v1/plan-records/save`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: historyItem.query,
+            intentDescription: historyItem.intentDescription,
+            mode: historyItem.mode,
+            planLines: historyItem.lines,
+            recommendedSkills: historyItem.recommendedSkills,
+            supplement: "",
+          }),
+        });
+        const saveData = await saveRes.json().catch(() => ({}));
+        if (saveRes.ok && typeof saveData?.path === "string") {
+          historyItem.savedPath = saveData.path;
+        }
+      } catch {
+        // Keep UI usable even when local file save fails.
+      }
+      setPlanHistory((prev) => [historyItem, ...prev]);
+      // Plan is rendered in a dedicated UI panel below.
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Error: ${message}` },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function confirmAndExecute() {
+    if (!pendingPlan) return;
+    if (pendingPlan.executionMode === "user_exec") {
+      setExecutionChecklist(pendingPlan.taskChecklist);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            "该计划为“用户执行”模式：已生成可勾选 checklist。请按清单执行并在 chat 里反馈进展，我会基于 checklist 继续协助。",
+        },
+      ]);
+      setPlanHistory((prev) =>
+        prev.map((item) =>
+          item.requestId === pendingPlan.requestId
+            ? { ...item, taskChecklist: pendingPlan.taskChecklist, executionMode: pendingPlan.executionMode }
+            : item
+        )
+      );
+      setPendingPlan(null);
+      return;
+    }
+    const confirmedPlanLines = buildConfirmedPlanLines(pendingPlan.lines);
+    const stepConfigList = pendingPlan.lines.map((_, idx) => ({
+      stepIndex: idx,
+      step: pendingPlan.lines[idx],
+      agent: stepExecutionConfigs[idx]?.agent || pendingPlan.mode,
+      skills: stepExecutionConfigs[idx]?.skills || [],
+    }));
+    const selectedClawhubSlugs = (pendingPlan.clawhubSuggestions ?? [])
+      .filter((x) => x.userSelected)
+      .map((x) => x.slug);
+    const mergedConfirmedSkills = Array.from(
+      new Set([
+        ...stepConfigList.flatMap((x) => x.skills).filter((x) => x.trim().length > 0),
+        ...confirmedSkills,
+        ...selectedClawhubSlugs,
+      ])
+    );
+    setLoading(true);
+    setError(null);
+    const seedStepStates: Record<string, StepRunState> = {};
+    const epSteps = pendingPlan.executionPlan?.steps ?? [];
+    if (epSteps.length > 0) {
+      epSteps.forEach((s) => {
+        seedStepStates[s.id] = "pending";
+      });
+    } else {
+      pendingPlan.lines.forEach((_, i) => {
+        seedStepStates[`s${i + 1}`] = "pending";
+      });
+    }
+    setExecutionStepStates(seedStepStates);
+    setActiveTraceId(null);
+    setExecutionChecklist(
+      confirmedPlanLines.map((line, idx) => ({
+        id: `exec_${Date.now()}_${idx}`,
+        text: line,
+        done: false,
+      }))
+    );
+    setMessages((prev) => [...prev, { role: "assistant", content: "已确认计划，开始执行..." }]);
+    let blockedExecution = false;
+    let capturedTraceId: string | null = null;
+    const historyRequestId = pendingPlan.requestId;
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/unified/execute/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requestId: pendingPlan.requestId,
+          tenantId,
+          requestType: "chat",
+          messages: [{ role: "user", content: pendingPlan.query }],
+          inputs: {
+            strategy,
+            confirmed: true,
+            confirmedPlan: confirmedPlanLines,
+            executionPlan: pendingPlan.executionPlan,
+            planSupplement,
+            missingSkills: pendingPlan.missingSkills,
+            autoInstallMissing,
+            confirmedSkills: mergedConfirmedSkills.length > 0 ? mergedConfirmedSkills : confirmedSkills,
+            stepExecutions: stepConfigList,
+            taskChecklist: pendingPlan.taskChecklist,
+            executionMode: pendingPlan.executionMode,
+            stepApprovals,
+            folderAuthorizations: planFolderAuths,
+            clawhubSelectedSlugs: selectedClawhubSlugs,
+            llmConfig:
+              deepseekConfig.enabled && deepseekConfig.apiKey.trim()
+                ? {
+                    provider: "deepseek",
+                    apiKey: deepseekConfig.apiKey.trim(),
+                    baseUrl: deepseekConfig.baseUrl.trim(),
+                    model: deepseekConfig.model.trim(),
+                  }
+                : null,
+          },
+        }),
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.detail ?? "Stream request failed");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const raw of events) {
+          const lines = raw.split("\n");
+          const dataLine = lines.find((line) => line.startsWith("data: "));
+          if (!dataLine) continue;
+          const payload = JSON.parse(dataLine.slice(6)) as {
+            type: string;
+            message?: string;
+            mode?: string;
+            content?: string;
+            answer?: string;
+            blocked?: boolean;
+            pendingApprovalStepId?: string;
+            skill?: string;
+            status?: string;
+            stepId?: string;
+            stepIndex?: number;
+            step?: string;
+            summary?: string;
+            riskLevel?: string;
+            allow?: boolean;
+            reason?: string;
+            decision?: string;
+            trace?: { total?: number; success?: number; failed?: number };
+            data?: Array<{ id?: string; name?: string; installed?: boolean }>;
+            traceId?: string;
+            ok?: boolean;
+            error?: string;
+          };
+          if (payload.type === "trace" && payload.traceId) {
+            capturedTraceId = payload.traceId;
+            setActiveTraceId(payload.traceId);
+          } else if (payload.type === "status" || payload.type === "mode") {
+            setMessages((prev) => [...prev, { role: "assistant", content: payload.message ?? "" }]);
+          } else if (payload.type === "install") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `安装事件: ${payload.skill ?? "unknown"} -> ${payload.status ?? "unknown"}`,
+              },
+            ]);
+          } else if (payload.type === "thought") {
+            setMessages((prev) => [...prev, { role: "assistant", content: `链路: ${payload.content ?? ""}` }]);
+          } else if (payload.type === "skill_start") {
+            setMessages((prev) => [...prev, { role: "assistant", content: `调用 skill: ${payload.skill ?? ""}` }]);
+          } else if (payload.type === "skill_result") {
+            const lines =
+              Array.isArray(payload.data) && payload.data.length > 0
+                ? payload.data
+                    .map((x) => `- ${x.name ?? x.id ?? "unknown"} (${x.installed ? "installed" : "not installed"})`)
+                    .join("\n")
+                : "no data";
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: `skill结果: ${payload.summary ?? ""}\n${lines}` },
+            ]);
+          } else if (payload.type === "step_start") {
+            if (payload.stepId) setStepRunState(payload.stepId, "running");
+          } else if (payload.type === "step_done") {
+            if (payload.stepId) setStepRunState(payload.stepId, payload.status === "failed" ? "failed" : "success");
+          } else if (payload.type === "policy_check") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `策略检查: ${payload.stepId ?? ""} risk=${payload.riskLevel ?? "unknown"} allow=${String(payload.allow)}`,
+              },
+            ]);
+          } else if (payload.type === "approval_required") {
+            if (payload.stepId) setStepRunState(payload.stepId, "running");
+            if (payload.stepId) setPendingApprovalStepId(payload.stepId);
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `需要审批: ${payload.stepId ?? ""} ${payload.reason ?? ""}（${payload.decision ?? "pending"}）`,
+              },
+            ]);
+          } else if (payload.type === "trace_summary") {
+            const s = payload.trace;
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `Trace: total=${s?.total ?? 0}, success=${s?.success ?? 0}, failed=${s?.failed ?? 0}`,
+              },
+            ]);
+          } else if (payload.type === "schema_check") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `Schema: step ${payload.stepId ?? "?"} ok=${String(payload.ok)} ${payload.error ?? ""}`,
+              },
+            ]);
+          } else if (payload.type === "done") {
+            if (payload.blocked) {
+              blockedExecution = true;
+              setPendingApprovalStepId(payload.pendingApprovalStepId ?? null);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  role: "assistant",
+                  content: `执行已暂停：等待审批步骤 ${payload.pendingApprovalStepId ?? ""}。请在计划面板点击“同意并继续执行”。`,
+                },
+              ]);
+            } else {
+              setPendingApprovalStepId(null);
+              setExecutionChecklist((prev) => prev.map((item) => ({ ...item, done: true })));
+              setMessages((prev) => [
+                ...prev,
+                { role: "assistant", content: `最终结果:\n${payload.answer ?? ""}` },
+              ]);
+              if (capturedTraceId) {
+                setPlanHistory((prev) =>
+                  prev.map((it) =>
+                    it.requestId === historyRequestId ? { ...it, lastTraceId: capturedTraceId! } : it
+                  )
+                );
+              }
+            }
+          }
+        }
+      }
+      if (!blockedExecution) {
+        setPendingPlan(null);
+        setPlanSupplement("");
+        setPlanBranches({});
+        setSelectedPlanBranch({});
+        setPlanBranchInput({});
+        setStepExecutionConfigs({});
+        setExecutionStepStates({});
+        setStepApprovals({});
+        setActiveTraceId(null);
+      }
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${message}` }]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function executePlanItem(item: PlanHistoryItem) {
+    if (item.executionMode === "user_exec") {
+      loadHistoryPlan(item);
+      setExecutionChecklist(item.taskChecklist ?? []);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            "该计划是“用户执行”模式，不会直接调用 LLM 执行。请先勾选/更新 task checklist，然后点击“按选中 checklist 继续对话”。",
+        },
+      ]);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    const seedStepStates: Record<string, StepRunState> = {};
+    (item.executionPlan?.steps ?? []).forEach((s) => {
+      seedStepStates[s.id] = "pending";
+    });
+    setExecutionStepStates(seedStepStates);
+    setStrategy(item.mode);
+    setExecutionChecklist(
+      item.lines.map((line, idx) => ({
+        id: `history_${Date.now()}_${idx}`,
+        text: line,
+        done: false,
+      }))
+    );
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: item.query },
+      { role: "assistant", content: `使用历史计划执行（mode: ${item.mode}）...` },
+    ]);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/unified/execute/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requestId: item.requestId || newRequestId(),
+          tenantId,
+          requestType: "chat",
+          messages: [{ role: "user", content: item.query }],
+          inputs: {
+            strategy: item.mode,
+            confirmed: true,
+            confirmedPlan: item.lines,
+            executionPlan: item.executionPlan,
+            planSupplement: item.supplement ?? "",
+            missingSkills: [],
+            autoInstallMissing: false,
+            confirmedSkills: Array.from(
+              new Set([
+                ...item.recommendedSkills,
+                ...(item.clawhubSuggestions ?? []).filter((x) => x.userSelected).map((x) => x.slug),
+              ])
+            ),
+            clawhubSelectedSlugs: (item.clawhubSuggestions ?? [])
+              .filter((x) => x.userSelected)
+              .map((x) => x.slug),
+            taskChecklist: item.taskChecklist ?? [],
+            executionMode: item.executionMode ?? "auto_exec",
+            llmConfig:
+              deepseekConfig.enabled && deepseekConfig.apiKey.trim()
+                ? {
+                    provider: "deepseek",
+                    apiKey: deepseekConfig.apiKey.trim(),
+                    baseUrl: deepseekConfig.baseUrl.trim(),
+                    model: deepseekConfig.model.trim(),
+                  }
+                : null,
+          },
+        }),
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.detail ?? "Stream request failed");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const raw of events) {
+          const lines = raw.split("\n");
+          const dataLine = lines.find((line) => line.startsWith("data: "));
+          if (!dataLine) continue;
+          const payload = JSON.parse(dataLine.slice(6)) as {
+            type: string;
+            message?: string;
+            content?: string;
+            answer?: string;
+            skill?: string;
+            status?: string;
+            stepId?: string;
+            stepIndex?: number;
+            step?: string;
+            summary?: string;
+            riskLevel?: string;
+            allow?: boolean;
+            reason?: string;
+            decision?: string;
+            trace?: { total?: number; success?: number; failed?: number };
+            data?: Array<{ id?: string; name?: string; installed?: boolean }>;
+          };
+          if (payload.type === "status" || payload.type === "mode") {
+            setMessages((prev) => [...prev, { role: "assistant", content: payload.message ?? "" }]);
+          } else if (payload.type === "install") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `安装事件: ${payload.skill ?? "unknown"} -> ${payload.status ?? "unknown"}`,
+              },
+            ]);
+          } else if (payload.type === "thought") {
+            setMessages((prev) => [...prev, { role: "assistant", content: `链路: ${payload.content ?? ""}` }]);
+          } else if (payload.type === "skill_start") {
+            setMessages((prev) => [...prev, { role: "assistant", content: `调用 skill: ${payload.skill ?? ""}` }]);
+          } else if (payload.type === "skill_result") {
+            const lines =
+              Array.isArray(payload.data) && payload.data.length > 0
+                ? payload.data
+                    .map((x) => `- ${x.name ?? x.id ?? "unknown"} (${x.installed ? "installed" : "not installed"})`)
+                    .join("\n")
+                : "no data";
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: `skill结果: ${payload.summary ?? ""}\n${lines}` },
+            ]);
+          } else if (payload.type === "step_start") {
+            if (payload.stepId) setStepRunState(payload.stepId, "running");
+          } else if (payload.type === "step_done") {
+            if (payload.stepId) setStepRunState(payload.stepId, payload.status === "failed" ? "failed" : "success");
+          } else if (payload.type === "policy_check") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `策略检查: ${payload.stepId ?? ""} risk=${payload.riskLevel ?? "unknown"} allow=${String(payload.allow)}`,
+              },
+            ]);
+          } else if (payload.type === "approval_required") {
+            if (payload.stepId) setStepRunState(payload.stepId, "running");
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `需要审批: ${payload.stepId ?? ""} ${payload.reason ?? ""}（${payload.decision ?? "pending"}）`,
+              },
+            ]);
+          } else if (payload.type === "trace_summary") {
+            const s = payload.trace;
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: `Trace: total=${s?.total ?? 0}, success=${s?.success ?? 0}, failed=${s?.failed ?? 0}`,
+              },
+            ]);
+          } else if (payload.type === "done") {
+            setExecutionChecklist((prev) => prev.map((check) => ({ ...check, done: true })));
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: `最终结果:\n${payload.answer ?? ""}` },
+            ]);
+          }
+        }
+      }
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${message}` }]);
+    } finally {
+      setLoading(false);
+      setExecutionStepStates({});
+    }
+  }
+
+  function cancelPlan() {
+    setPendingPlan(null);
+    setPlanSupplement("");
+    setPlanBranches({});
+    setSelectedPlanBranch({});
+    setPlanBranchInput({});
+    setStepExecutionConfigs({});
+    setPlanFolderAuths([]);
+    setPlanFolderPathInput("");
+    setPlanFolderPermInput("777");
+    setExecutionChecklist([]);
+    setMessages((prev) => [...prev, { role: "assistant", content: "已取消本次计划执行。" }]);
+  }
+
+  function updatePlanLine(index: number, value: string) {
+    setPendingPlan((prev) => {
+      if (!prev) return prev;
+      const nextLines = [...prev.lines];
+      nextLines[index] = value;
+      setPlanHistory((items) =>
+        items.map((item) =>
+          item.requestId === prev.requestId ? { ...item, lines: nextLines } : item
+        )
+      );
+      return { ...prev, lines: nextLines };
+    });
+  }
+
+  function toggleFavorite(itemId: string) {
+    setPlanHistory((prev) =>
+      prev.map((item) => (item.id === itemId ? { ...item, favorite: !item.favorite } : item))
+    );
+  }
+
+  function deletePlanItem(itemId: string) {
+    setPlanHistory((prev) => prev.filter((item) => item.id !== itemId));
+  }
+
+  function loadHistoryPlan(item: PlanHistoryItem) {
+    setPendingPlan({
+      requestId: item.requestId,
+      query: item.query,
+      mode: item.mode,
+      intentDescription: item.intentDescription,
+      thinking: "",
+      searchEvidence: [],
+      lines: [...item.lines],
+      recommendedSkills: [...item.recommendedSkills],
+      missingSkills: [],
+      installRequired: false,
+      requiredSkills: [...item.recommendedSkills],
+      executionMode: item.executionMode === "user_exec" ? "user_exec" : "auto_exec",
+      taskChecklist: Array.isArray(item.taskChecklist)
+        ? item.taskChecklist.map((x, idx) => ({
+            id: x.id || `history_${item.requestId}_${idx}`,
+            text: x.text,
+            done: Boolean(x.done),
+          }))
+        : item.lines.map((line, idx) => ({
+            id: `history_${item.requestId}_${idx}`,
+            text: line,
+            done: false,
+          })),
+      clawhubSuggestions: normalizeClawhubSuggestions(item.clawhubSuggestions),
+      executionPlan: normalizeExecutionPlan(item.executionPlan, item.lines, item.mode),
+    });
+    setConfirmedSkills([...item.recommendedSkills]);
+    setPlanSupplement(item.supplement ?? "");
+    setPlanBranches(item.planBranches ?? {});
+    setSelectedPlanBranch(item.selectedPlanBranch ?? {});
+    setPlanBranchInput({});
+    const initialStepConfigs: Record<number, StepExecutionConfig> =
+      item.stepExecutionConfigs && Object.keys(item.stepExecutionConfigs).length > 0
+        ? item.stepExecutionConfigs
+        : (() => {
+            const fallback: Record<number, StepExecutionConfig> = {};
+            item.lines.forEach((_, idx) => {
+              fallback[idx] = {
+                agent: item.mode,
+                skills: [...item.recommendedSkills],
+              };
+            });
+            return fallback;
+          })();
+    setStepExecutionConfigs(initialStepConfigs);
+    setStrategy(item.mode);
+  }
+
+  function updatePendingTaskChecklist(checklist: ExecutionChecklistItem[]) {
+    setPendingPlan((prev) => {
+      if (!prev) return prev;
+      return { ...prev, taskChecklist: checklist };
+    });
+    if (pendingPlan) {
+      setPlanHistory((prev) =>
+        prev.map((item) =>
+          item.requestId === pendingPlan.requestId ? { ...item, taskChecklist: checklist } : item
+        )
+      );
+    }
+  }
+
+  function setStepRunState(stepId: string, state: StepRunState) {
+    setExecutionStepStates((prev) => ({ ...prev, [stepId]: state }));
+  }
+
+  function continueChatWithChecklist() {
+    if (!pendingPlan) return;
+    const checked = pendingPlan.taskChecklist.filter((x) => x.done);
+    const unchecked = pendingPlan.taskChecklist.filter((x) => !x.done);
+    const checkedText = checked.length > 0 ? checked.map((x) => `- ${x.text}`).join("\n") : "- 无";
+    const uncheckedText = unchecked.length > 0 ? unchecked.map((x) => `- ${x.text}`).join("\n") : "- 无";
+    const prompt =
+      `基于这个计划继续协助我。\n` +
+      `已完成 checklist:\n${checkedText}\n\n` +
+      `未完成 checklist:\n${uncheckedText}\n\n` +
+      `请给我下一步最优先动作，并说明原因。`;
+    setInput(prompt);
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: "已将选中的 checklist 生成到输入框，点击 Send 继续对话。" },
+    ]);
+  }
+
+  function updatePlanSupplement(value: string) {
+    setPlanSupplement(value);
+    if (!pendingPlan) return;
+    setPlanHistory((prev) =>
+      prev.map((item) =>
+        item.requestId === pendingPlan.requestId ? { ...item, supplement: value } : item
+      )
+    );
+  }
+
+  function toggleClawhubSuggestion(slug: string, selected: boolean) {
+    setPendingPlan((prev) => {
+      if (!prev) return prev;
+      const nextSuggestions = (prev.clawhubSuggestions ?? []).map((s) =>
+        s.slug === slug ? { ...s, userSelected: selected } : s
+      );
+      const rid = prev.requestId;
+      setPlanHistory((hist) =>
+        hist.map((item) =>
+          item.requestId === rid ? { ...item, clawhubSuggestions: nextSuggestions } : item
+        )
+      );
+      return { ...prev, clawhubSuggestions: nextSuggestions };
+    });
+  }
+
+  const filteredPlanRecords = useMemo(() => {
+    const q = planRecordSearch.trim().toLowerCase();
+    if (!q) return planHistory;
+    return planHistory.filter(
+      (item) =>
+        item.query.toLowerCase().includes(q) ||
+        item.intentDescription.toLowerCase().includes(q) ||
+        item.mode.toLowerCase().includes(q) ||
+        item.recommendedSkills.join(" ").toLowerCase().includes(q)
+    );
+  }, [planHistory, planRecordSearch]);
+
+  function applyFlowSkills(skills: string[]) {
+    const normalized = skills.filter((s) => s.trim().length > 0);
+    setFlowSkills(normalized);
+    setFlowNodes((prev) =>
+      prev.map((node) => {
+        if (node.id === "skills-node") {
+          return {
+            ...node,
+            data: {
+              ...(node.data || {}),
+              skills: normalized,
+              editable: flowEditable,
+              onAddSkill: (skill: string) => addFlowSkillByNode(skill),
+              onRemoveSkill: (skill: string) => removeFlowSkill(skill),
+            },
+          };
+        }
+        const label = String(node.data?.label ?? "");
+        const updatedLabel = label.replace(
+          /skill:\s*.*/i,
+          `skill: ${normalized.length > 0 ? normalized.join(", ") : "none"}`
+        );
+        return { ...node, data: { ...node.data, label: updatedLabel } };
+      })
+    );
+  }
+
+  function buildFlowGraph(source: FlowSource) {
+    const nodes: Node[] = source.lines.map((line, idx) => ({
+      id: `n-${idx + 1}`,
+      position: { x: 80 + idx * 280, y: 120 },
+      data: {
+        label: `Step ${idx + 1}\n${line}\nagent: ${source.mode}\nskill: ${
+          source.skills.length > 0 ? source.skills.join(", ") : "none"
+        }`,
+      },
+      draggable: true,
+      style: {
+        color: "#7a5a1f",
+        background: "#f3e2b3",
+        border: "1px solid #d6b36a",
+        borderRadius: "8px",
+        fontSize: "12px",
+        whiteSpace: "pre-wrap",
+        width: 240,
+      },
+    }));
+    const skillNode: Node = {
+      id: "skills-node",
+      type: "skillNode",
+      position: { x: 80 + Math.max(0, source.lines.length - 1) * 280, y: 320 },
+      data: {
+        skills: source.skills,
+        editable: flowEditable,
+        onAddSkill: (skill: string) => addFlowSkillByNode(skill),
+        onRemoveSkill: (skill: string) => removeFlowSkill(skill),
+      },
+      draggable: true,
+    };
+    const authNode: Node = {
+      id: "auth-node",
+      position: { x: 80, y: 420 },
+      data: {
+        label: "Folder Auth\nnone",
+      },
+      draggable: true,
+      style: {
+        color: "#7a5a1f",
+        background: "#f8eed4",
+        border: "1px solid #d6b36a",
+        borderRadius: "8px",
+        fontSize: "12px",
+        whiteSpace: "pre-wrap",
+        width: 280,
+      },
+    };
+    const edges: Edge[] = source.lines.slice(1).map((_, idx) => ({
+      id: `e-${idx + 1}-${idx + 2}`,
+      source: `n-${idx + 1}`,
+      target: `n-${idx + 2}`,
+      animated: true,
+    }));
+    if (nodes.length > 0) {
+      edges.push({
+        id: "e-last-skill",
+        source: `n-${nodes.length}`,
+        target: "skills-node",
+        animated: true,
+      });
+    }
+    edges.push({
+      id: "e-skill-auth",
+      source: "skills-node",
+      target: "auth-node",
+      animated: true,
+    });
+    return { nodes: [...nodes, skillNode, authNode], edges };
+  }
+
+  function openTaskFlow(source: FlowSource, editable: boolean) {
+    const graph = buildFlowGraph(source);
+    setFlowNodes(graph.nodes);
+    setFlowEdges(graph.edges);
+    setFlowEditable(editable);
+    setFlowTitle(source.title);
+    setFlowSkills(source.skills);
+    setFlowSkillInput("");
+    setFlowFolderAuths([]);
+    setFlowFolderPathInput("");
+    setFlowFolderPermInput("777");
+    setFlowOpen(true);
+  }
+
+  function onFlowConnect(params: Edge | Connection) {
+    if (!flowEditable) return;
+    setFlowEdges((eds) => addEdge(params, eds));
+  }
+
+  function addFlowSkillByNode(skill: string) {
+    const next = skill.trim();
+    if (!next) return;
+    if (flowSkills.includes(next)) return;
+    applyFlowSkills([...flowSkills, next]);
+  }
+
+  function addFlowSkill() {
+    const next = flowSkillInput.trim();
+    if (!next) return;
+    addFlowSkillByNode(next);
+    setFlowSkillInput("");
+  }
+
+  function removeFlowSkill(skill: string) {
+    applyFlowSkills(flowSkills.filter((s) => s !== skill));
+  }
+
+  function applyFlowFolderAuths(next: FolderAuthorization[]) {
+    setFlowFolderAuths(next);
+    const label =
+      next.length > 0
+        ? `Folder Auth\n${next.map((x) => `${x.path} (${x.permission})`).join("\n")}`
+        : "Folder Auth\nnone";
+    setFlowNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== "auth-node") return node;
+        return { ...node, data: { ...node.data, label } };
+      })
+    );
+  }
+
+  function normalizePermission(input: string) {
+    const value = input.trim();
+    if (!/^[0-7]{3}$/.test(value)) return "777";
+    return value;
+  }
+
+  function newBranchId() {
+    return `b_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+  }
+
+  function branchInputKey(stepIndex: number, parentId: string | null) {
+    return `${stepIndex}:${parentId ?? "__root__"}`;
+  }
+
+  function buildConfirmedPlanLines(lines: string[]) {
+    const result: string[] = [];
+    lines.forEach((line, idx) => {
+      result.push(line);
+      const nodes: PlanBranchNode[] = planBranches[idx] ?? [];
+      const selectedMap: Record<string, string> = selectedPlanBranch[idx] ?? {};
+      let parentId: string | null = null;
+      while (true) {
+        const key: string = parentId ?? "__root__";
+        const nextId: string | undefined = selectedMap[key];
+        if (!nextId) break;
+        const node: PlanBranchNode | undefined = nodes.find((n) => n.id === nextId);
+        if (!node) break;
+        const text = node.text.trim();
+        if (text) result.push(`分支: ${text}`);
+        parentId = node.id;
+      }
+    });
+    return result;
+  }
+
+  function addPlanBranch(stepIndex: number, parentId: string | null) {
+    const key = branchInputKey(stepIndex, parentId);
+    const raw = (planBranchInput[key] ?? "").trim();
+    if (!raw) return;
+    const nextNode: PlanBranchNode = { id: newBranchId(), parentId, text: raw };
+    setPlanBranches((prev) => {
+      const list = prev[stepIndex] ?? [];
+      const next = { ...prev, [stepIndex]: [...list, nextNode] };
+      if (pendingPlan) {
+        setPlanHistory((items) =>
+          items.map((item) =>
+            item.requestId === pendingPlan.requestId ? { ...item, planBranches: next } : item
+          )
+        );
+      }
+      return next;
+    });
+    const parentKey = parentId ?? "__root__";
+    setSelectedPlanBranch((prev) => {
+      const next = {
+        ...prev,
+        [stepIndex]: { ...(prev[stepIndex] ?? {}), [parentKey]: nextNode.id },
+      };
+      if (pendingPlan) {
+        setPlanHistory((items) =>
+          items.map((item) =>
+            item.requestId === pendingPlan.requestId ? { ...item, selectedPlanBranch: next } : item
+          )
+        );
+      }
+      return next;
+    });
+    setPlanBranchInput((prev) => ({ ...prev, [key]: "" }));
+  }
+
+  function updatePlanBranch(stepIndex: number, branchId: string, value: string) {
+    setPlanBranches((prev) => {
+      const list = [...(prev[stepIndex] ?? [])];
+      const idx = list.findIndex((x) => x.id === branchId);
+      if (idx >= 0) {
+        list[idx] = { ...list[idx], text: value };
+      }
+      const next = { ...prev, [stepIndex]: list };
+      if (pendingPlan) {
+        setPlanHistory((items) =>
+          items.map((item) =>
+            item.requestId === pendingPlan.requestId ? { ...item, planBranches: next } : item
+          )
+        );
+      }
+      return next;
+    });
+  }
+
+  function removePlanBranch(stepIndex: number, branchId: string) {
+    setPlanBranches((prev) => {
+      const list = [...(prev[stepIndex] ?? [])];
+      const removeSet = new Set<string>([branchId]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const node of list) {
+          if (node.parentId && removeSet.has(node.parentId) && !removeSet.has(node.id)) {
+            removeSet.add(node.id);
+            changed = true;
+          }
+        }
+      }
+      const filtered = list.filter((x) => !removeSet.has(x.id));
+      const next = { ...prev };
+      if (filtered.length === 0) {
+        delete next[stepIndex];
+      } else {
+        next[stepIndex] = filtered;
+      }
+      if (pendingPlan) {
+        setPlanHistory((items) =>
+          items.map((item) =>
+            item.requestId === pendingPlan.requestId ? { ...item, planBranches: next } : item
+          )
+        );
+      }
+      return next;
+    });
+    setSelectedPlanBranch((prev) => {
+      const map = { ...(prev[stepIndex] ?? {}) };
+      Object.keys(map).forEach((k) => {
+        if (map[k] === branchId) delete map[k];
+      });
+      const next = { ...prev, [stepIndex]: map };
+      if (pendingPlan) {
+        setPlanHistory((items) =>
+          items.map((item) =>
+            item.requestId === pendingPlan.requestId ? { ...item, selectedPlanBranch: next } : item
+          )
+        );
+      }
+      return next;
+    });
+    setPlanBranchInput((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((k) => {
+        if (k.startsWith(`${stepIndex}:${branchId}`)) {
+          delete next[k];
+        }
+      });
+      return next;
+    });
+  }
+
+  function renderBranchEditor(stepIndex: number, parentId: string | null, level: number): ReactElement {
+    const nodes = (planBranches[stepIndex] ?? []).filter((x) => x.parentId === parentId);
+    const parentKey = parentId ?? "__root__";
+    return (
+      <div className={level > 0 ? "ml-6 mt-1 space-y-1" : "space-y-1"}>
+        {nodes.map((node) => (
+          <div key={node.id} className="space-y-1">
+            <div className="flex items-center gap-2">
+              <input
+                type="radio"
+                name={`plan-branch-${stepIndex}-${parentKey}`}
+                checked={(selectedPlanBranch[stepIndex] ?? {})[parentKey] === node.id}
+                onChange={() =>
+                  setSelectedPlanBranch((prev) => {
+                    const next = {
+                      ...prev,
+                      [stepIndex]: { ...(prev[stepIndex] ?? {}), [parentKey]: node.id },
+                    };
+                    if (pendingPlan) {
+                      setPlanHistory((items) =>
+                        items.map((item) =>
+                          item.requestId === pendingPlan.requestId
+                            ? { ...item, selectedPlanBranch: next }
+                            : item
+                        )
+                      );
+                    }
+                    return next;
+                  })
+                }
+              />
+              <input
+                className="flex-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                value={node.text}
+                onChange={(e) => updatePlanBranch(stepIndex, node.id, e.target.value)}
+              />
+              <AppButton type="button" size="xs" variant="danger" onClick={() => removePlanBranch(stepIndex, node.id)}>
+                删除
+              </AppButton>
+            </div>
+            {renderBranchEditor(stepIndex, node.id, level + 1)}
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <input
+            className="flex-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+            placeholder={level === 0 ? "新增分支，例如：如果基础薄弱先补 JS" : "新增子分支"}
+            value={planBranchInput[branchInputKey(stepIndex, parentId)] ?? ""}
+            onChange={(e) =>
+              setPlanBranchInput((prev) => ({
+                ...prev,
+                [branchInputKey(stepIndex, parentId)]: e.target.value,
+              }))
+            }
+          />
+          <AppButton type="button" size="xs" variant="info" onClick={() => addPlanBranch(stepIndex, parentId)}>
+            添加分支
+          </AppButton>
+        </div>
+      </div>
+    );
+  }
+
+  const whitelistedSkills = useMemo(() => {
+    if (capabilityWhitelist.length > 0) return capabilityWhitelist;
+    return capabilitySkills.filter((s) => Boolean(s.whitelisted)).map((s) => s.id);
+  }, [capabilityWhitelist, capabilitySkills]);
+
+  function updateStepAgent(stepIndex: number, agentId: string) {
+    setStepExecutionConfigs((prev) => {
+      const next = {
+        ...prev,
+        [stepIndex]: {
+          agent: agentId,
+          skills: prev[stepIndex]?.skills ?? [],
+        },
+      };
+      if (pendingPlan) {
+        setPlanHistory((items) =>
+          items.map((item) =>
+            item.requestId === pendingPlan.requestId ? { ...item, stepExecutionConfigs: next } : item
+          )
+        );
+      }
+      return next;
+    });
+  }
+
+  function toggleStepSkill(stepIndex: number, skillId: string, enabled: boolean) {
+    setStepExecutionConfigs((prev) => {
+      const current = prev[stepIndex] ?? { agent: pendingPlan?.mode ?? "agent", skills: [] };
+      const nextSkills = enabled
+        ? Array.from(new Set([...current.skills, skillId]))
+        : current.skills.filter((x) => x !== skillId);
+      return {
+        ...prev,
+        [stepIndex]: { ...current, skills: nextSkills },
+      };
+    });
+    if (pendingPlan) {
+      setPlanHistory((items) =>
+        items.map((item) => {
+          if (item.requestId !== pendingPlan.requestId) return item;
+          const current = item.stepExecutionConfigs ?? {};
+          const stepCurrent = current[stepIndex] ?? { agent: pendingPlan.mode, skills: [] };
+          const nextSkills = enabled
+            ? Array.from(new Set([...(stepCurrent.skills ?? []), skillId]))
+            : (stepCurrent.skills ?? []).filter((x) => x !== skillId);
+          return {
+            ...item,
+            stepExecutionConfigs: {
+              ...current,
+              [stepIndex]: { ...stepCurrent, skills: nextSkills },
+            },
+          };
+        })
+      );
+    }
+  }
+
+  function addPlanFolderAuth() {
+    const path = planFolderPathInput.trim();
+    if (!path) return;
+    const permission = normalizePermission(planFolderPermInput);
+    const exists = planFolderAuths.some((x) => x.path === path);
+    const next = exists
+      ? planFolderAuths.map((x) => (x.path === path ? { ...x, permission } : x))
+      : [...planFolderAuths, { path, permission }];
+    setPlanFolderAuths(next);
+    setPlanFolderPermInput(permission);
+    setPlanFolderPathInput("");
+  }
+
+  function removePlanFolderAuth(path: string) {
+    setPlanFolderAuths((prev) => prev.filter((x) => x.path !== path));
+  }
+
+  async function pickPlanFolderPath() {
+    const picker = (window as Window & { showDirectoryPicker?: () => Promise<{ name?: string }> }).showDirectoryPicker;
+    if (!picker) return;
+    try {
+      const handle = await picker();
+      if (handle?.name) {
+        setPlanFolderPathInput(handle.name);
+      }
+    } catch {
+      // User canceled directory picker.
+    }
+  }
+
+  function addFlowFolderAuth() {
+    const path = flowFolderPathInput.trim();
+    if (!path) return;
+    const permission = normalizePermission(flowFolderPermInput);
+    const exists = flowFolderAuths.some((x) => x.path === path);
+    const next = exists
+      ? flowFolderAuths.map((x) => (x.path === path ? { ...x, permission } : x))
+      : [...flowFolderAuths, { path, permission }];
+    applyFlowFolderAuths(next);
+    setFlowFolderPermInput(permission);
+    setFlowFolderPathInput("");
+  }
+
+  function removeFlowFolderAuth(path: string) {
+    applyFlowFolderAuths(flowFolderAuths.filter((x) => x.path !== path));
+  }
+
+  async function pickFolderPath() {
+    if (!flowEditable) return;
+    const picker = (window as Window & { showDirectoryPicker?: () => Promise<{ name?: string }> }).showDirectoryPicker;
+    if (!picker) return;
+    try {
+      const handle = await picker();
+      if (handle?.name) {
+        setFlowFolderPathInput(handle.name);
+      }
+    } catch {
+      // User canceled directory picker.
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-zinc-50 dark:bg-black">
+      <header className="p-5 border-b border-zinc-200 dark:border-zinc-800">
+        <div className="max-w-3xl mx-auto flex items-center gap-3">
+          <div className="font-semibold">Chat UI</div>
+          <div className="text-sm text-zinc-500">FastAPI + LangGraph</div>
+          <AppButton
+            type="button"
+            className="ml-auto"
+            onClick={async () => {
+              try {
+                await loadCapabilities("", 1);
+                await loadCustomAgents();
+                await loadPersonalSkillTree();
+                setCapabilityOpen(true);
+              } catch (e: unknown) {
+                setError(e instanceof Error ? e.message : String(e));
+              }
+            }}
+          >
+            Agent/Skill
+          </AppButton>
+          <AppButton type="button" onClick={newChat}>
+            New Chat
+          </AppButton>
+          <AppButton type="button" onClick={() => setDeepseekOpen(true)}>
+            DeepSeek
+          </AppButton>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto p-5 grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
+        <aside className="border border-zinc-200 dark:border-zinc-800 rounded bg-white dark:bg-zinc-900 p-3 h-fit">
+          <div className="text-sm font-semibold">计划记录</div>
+          <div className="text-xs text-zinc-500 mt-1">卡片展示，支持搜索</div>
+          <AppButton type="button" size="md" className="mt-3 w-full" onClick={() => setPlanRecordOpen(true)}>
+            查看计划记录
+          </AppButton>
+          <div className="mt-2 text-xs text-zinc-500">共 {planHistory.length} 条</div>
+          {(executionChecklist.length > 0 || (pendingPlan?.taskChecklist?.length ?? 0) > 0) ? (
+            <div className="mt-4 border-t border-zinc-200 dark:border-zinc-700 pt-3">
+              <div className="text-sm font-semibold">执行 Checklist</div>
+              <div className="mt-2 space-y-1">
+                {(executionChecklist.length > 0 ? executionChecklist : pendingPlan?.taskChecklist ?? []).map((item) => (
+                  <label
+                    key={item.id}
+                    className="text-xs flex items-start gap-2 border border-zinc-200 dark:border-zinc-700 rounded px-2 py-1"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={item.done}
+                      onChange={(e) =>
+                        executionChecklist.length > 0
+                          ? setExecutionChecklist((prev) =>
+                              prev.map((x) => (x.id === item.id ? { ...x, done: e.target.checked } : x))
+                            )
+                          : updatePendingTaskChecklist(
+                              (pendingPlan?.taskChecklist ?? []).map((x) =>
+                                x.id === item.id ? { ...x, done: e.target.checked } : x
+                              )
+                            )
+                      }
+                    />
+                    <span className={item.done ? "line-through text-zinc-400" : ""}>{item.text}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {Object.keys(executionStepStates).length > 0 ? (
+            <div className="mt-4 border-t border-zinc-200 dark:border-zinc-700 pt-3">
+              <div className="text-sm font-semibold">Step 执行状态</div>
+              <div className="mt-2 space-y-1">
+                {Object.entries(executionStepStates).map(([sid, st]) => (
+                  <div
+                    key={sid}
+                    className="text-xs border border-zinc-200 dark:border-zinc-700 rounded px-2 py-1 flex items-center justify-between"
+                  >
+                    <span className="font-mono text-zinc-500">{sid}</span>
+                    <span
+                      className={
+                        st === "running"
+                          ? "text-blue-600"
+                          : st === "success"
+                            ? "text-emerald-600"
+                            : st === "failed"
+                              ? "text-red-600"
+                              : "text-zinc-500"
+                      }
+                    >
+                      {st}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </aside>
+
+        <section className="flex flex-col gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <label className="flex flex-col gap-1">
+            <span className="text-sm text-zinc-600 dark:text-zinc-300">tenantId</span>
+            <input
+              className="border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900"
+              value={tenantId}
+              onChange={(e) => setTenantId(e.target.value)}
+            />
+          </label>
+
+          <label className="flex flex-col gap-1">
+            <span className="text-sm text-zinc-600 dark:text-zinc-300">strategy</span>
+            <select
+              className="border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900"
+              value={strategy}
+              onChange={(e) => setStrategy(e.target.value as Strategy)}
+            >
+              <option value="auto">auto</option>
+              <option value="agent">agent</option>
+              <option value="react">react</option>
+              <option value="workflow">workflow</option>
+            </select>
+          </label>
+
+          <div className="flex items-end">
+            <div className="text-xs text-zinc-500">
+              API: <span className="font-mono">{apiBaseUrl}</span>
+            </div>
+          </div>
+        </div>
+
+        <ChatPanel
+          messages={messages}
+          loading={loading}
+          error={error}
+          input={input}
+          onInputChange={setInput}
+          onSend={sendMessage}
+        />
+
+        {pendingPlan ? (
+          <div className="p-3 border border-zinc-300 dark:border-zinc-700 rounded bg-amber-50/70 dark:bg-zinc-900">
+            <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
+              执行计划待确认（mode: {pendingPlan.mode}）
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <div className="text-xs text-zinc-500">执行模式</div>
+              <select
+                className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                value={pendingPlan.executionMode}
+                onChange={(e) =>
+                  setPendingPlan((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          executionMode: e.target.value === "user_exec" ? "user_exec" : "auto_exec",
+                        }
+                      : prev
+                  )
+                }
+              >
+                <option value="auto_exec">系统自动执行（exec + test）</option>
+                <option value="user_exec">用户自行执行（仅输出 checklist）</option>
+              </select>
+            </div>
+            <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+              用户问题：{pendingPlan.query}
+            </div>
+            <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+              意图：{pendingPlan.intentDescription}
+            </div>
+            {pendingPlan.thinking ? (
+              <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap">
+                思考：{pendingPlan.thinking}
+              </div>
+            ) : null}
+            {pendingPlan.searchEvidence.length > 0 ? (
+              <div className="mt-2">
+                <div className="text-xs text-zinc-500 mb-1">检索依据</div>
+                <div className="space-y-1">
+                  {pendingPlan.searchEvidence.map((item, idx) => (
+                    <a
+                      key={`${item.url}-${idx}`}
+                      href={item.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="block text-xs text-indigo-700 hover:underline"
+                    >
+                      {idx + 1}. {item.title}
+                    </a>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {!loading &&
+            pendingPlan.clawhubSuggestions &&
+            pendingPlan.clawhubSuggestions.length > 0 ? (
+              <div className="mt-3">
+                <div className="text-xs text-zinc-500 mb-2">
+                  ClawHub 相关技能（向量检索 + 启发式/LLM 简要分析；<strong>默认不勾选</strong>
+                  ，确认执行时仅对你勾选的 slug 注册并纳入技能流）
+                </div>
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {pendingPlan.clawhubSuggestions.map((s) => (
+                    <div
+                      key={s.slug}
+                      className="border border-zinc-200 dark:border-zinc-700 rounded p-2 bg-white/60 dark:bg-zinc-800/80"
+                    >
+                      <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="mt-1 shrink-0"
+                          checked={Boolean(s.userSelected)}
+                          onChange={(e) => toggleClawhubSuggestion(s.slug, e.target.checked)}
+                        />
+                        <div className="flex-1 min-w-0 space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-sm font-medium text-zinc-800 dark:text-zinc-100">{s.name}</span>
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                s.riskLevel === "high"
+                                  ? "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
+                                  : s.riskLevel === "medium"
+                                    ? "bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100"
+                                    : "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100"
+                              }`}
+                            >
+                              risk {s.riskLevel}
+                            </span>
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                s.recommendation === "avoid"
+                                  ? "bg-red-50 text-red-700 dark:bg-red-950/50"
+                                  : s.recommendation === "review"
+                                    ? "bg-amber-50 text-amber-800 dark:bg-amber-950/50"
+                                    : "bg-emerald-50 text-emerald-800 dark:bg-emerald-950/50"
+                              }`}
+                            >
+                              {s.recommendation}
+                            </span>
+                          </div>
+                          <div className="text-[10px] font-mono text-zinc-500 break-all">{s.slug}</div>
+                          {s.summary ? (
+                            <div className="text-xs text-zinc-600 dark:text-zinc-400 line-clamp-2">{s.summary}</div>
+                          ) : null}
+                          <div className="text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">{s.analysis}</div>
+                          {typeof s.score === "number" ? (
+                            <div className="text-[10px] text-zinc-400">match score {s.score.toFixed(3)}</div>
+                          ) : null}
+                        </div>
+                      </label>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400">
+              推荐 skills:{" "}
+              {pendingPlan.recommendedSkills.length > 0
+                ? pendingPlan.recommendedSkills.join(", ")
+                : "无"}
+            </div>
+            <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+              缺失 skills: {pendingPlan.missingSkills.length > 0 ? pendingPlan.missingSkills.join(", ") : "无"}
+            </div>
+            <div className="mt-2">
+              <div className="text-xs text-zinc-500 mb-1">确认要使用的 skills</div>
+              <div className="flex flex-wrap gap-2">
+                {(pendingPlan.requiredSkills.length > 0
+                  ? pendingPlan.requiredSkills
+                  : pendingPlan.recommendedSkills
+                ).map((sid) => (
+                  <label
+                    key={sid}
+                    className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={confirmedSkills.includes(sid)}
+                      onChange={(e) =>
+                        setConfirmedSkills((prev) =>
+                          e.target.checked
+                            ? Array.from(new Set([...prev, sid]))
+                            : prev.filter((x) => x !== sid)
+                        )
+                      }
+                    />
+                    {sid}
+                  </label>
+                ))}
+              </div>
+            </div>
+            {activeTraceId ? (
+              <div className="mt-2 text-xs font-mono text-indigo-700 dark:text-indigo-300">
+                traceId: {activeTraceId}
+              </div>
+            ) : null}
+            <div className="mt-3 space-y-2">
+              {pendingPlan.lines.length > 0 ? (
+                pendingPlan.lines.map((line, idx) => {
+                  const stepIdForRow = pendingPlan.executionPlan?.steps?.[idx]?.id ?? `s${idx + 1}`;
+                  const rowState = executionStepStates[stepIdForRow];
+                  return (
+                  <div
+                    key={`${idx}`}
+                    className="text-sm text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded px-3 py-2 bg-white/70 dark:bg-zinc-800"
+                  >
+                    <div className="flex items-start gap-2">
+                      <span className="mt-2 text-xs text-zinc-500">{idx + 1}.</span>
+                      {rowState ? (
+                        <span
+                          className={`mt-1.5 text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                            rowState === "running"
+                              ? "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200"
+                              : rowState === "success"
+                                ? "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100"
+                                : rowState === "failed"
+                                  ? "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
+                                  : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                          }`}
+                        >
+                          {stepIdForRow}:{rowState}
+                        </span>
+                      ) : null}
+                      <input
+                        className="flex-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 bg-white dark:bg-zinc-900"
+                        value={line}
+                        onChange={(e) => updatePlanLine(idx, e.target.value)}
+                      />
+                    </div>
+                    <div className="mt-2 ml-6">
+                      <div className="mb-2 grid grid-cols-1 md:grid-cols-[200px_1fr] gap-2">
+                        <label className="text-xs text-zinc-500">
+                          agent
+                          <select
+                            className="mt-1 w-full border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                            value={stepExecutionConfigs[idx]?.agent ?? pendingPlan.mode}
+                            onChange={(e) => updateStepAgent(idx, e.target.value)}
+                          >
+                            {capabilityAgents.length > 0 ? (
+                              capabilityAgents.map((a) => (
+                                <option key={a.id} value={a.id}>
+                                  {a.label}
+                                </option>
+                              ))
+                            ) : (
+                              <option value={pendingPlan.mode}>{pendingPlan.mode}</option>
+                            )}
+                          </select>
+                        </label>
+                        <div>
+                          <div className="text-xs text-zinc-500 mb-1">skills（whitelist）</div>
+                          <div className="flex flex-wrap gap-2">
+                            {(whitelistedSkills.length > 0 ? whitelistedSkills : pendingPlan.requiredSkills).map((sid) => (
+                              <label
+                                key={`${idx}-${sid}`}
+                                className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(stepExecutionConfigs[idx]?.skills?.includes(sid))}
+                                  onChange={(e) => toggleStepSkill(idx, sid, e.target.checked)}
+                                />
+                                {sid}
+                              </label>
+                            ))}
+                            {whitelistedSkills.length === 0 && pendingPlan.requiredSkills.length === 0 ? (
+                              <div className="text-xs text-zinc-400">暂无 whitelist skill</div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="text-xs text-zinc-500 mb-1">后续分支</div>
+                      {renderBranchEditor(idx, null, 0)}
+                    </div>
+                  </div>
+                );
+                })
+              ) : (
+                <div className="text-sm text-zinc-500">未返回可展示的计划步骤。</div>
+              )}
+            </div>
+            {!loading &&
+            pendingPlan.lines.length > 0 &&
+            pendingPlan.lines.every((x) => x.trim().length > 0) &&
+            pendingPlan.taskChecklist.length > 0 ? (
+              <div className="mt-3">
+                <div className="text-xs text-zinc-500 mb-1">计划任务 Checklist（可勾选保存）</div>
+                <div className="space-y-1">
+                  {pendingPlan.taskChecklist.map((item) => (
+                    <label
+                      key={item.id}
+                      className="text-xs flex items-start gap-2 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={item.done}
+                        onChange={(e) =>
+                          updatePendingTaskChecklist(
+                            pendingPlan.taskChecklist.map((x) =>
+                              x.id === item.id ? { ...x, done: e.target.checked } : x
+                            )
+                          )
+                        }
+                      />
+                      <span className={item.done ? "line-through text-zinc-400" : ""}>{item.text}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <label className="mt-3 block">
+              <div className="text-xs text-zinc-500 mb-1">补充说明（可选）</div>
+              <textarea
+                className="w-full min-h-20 border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900 text-sm"
+                placeholder="例如：优先给出上海浦东今天白天逐小时天气，并附出行建议。"
+                value={planSupplement}
+                onChange={(e) => updatePlanSupplement(e.target.value)}
+              />
+            </label>
+            <div className="mt-3">
+              <div className="text-xs text-zinc-500 mb-1">本地文件夹授权（路径 + Linux 权限）</div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-[320px] bg-white dark:bg-zinc-900"
+                  placeholder="/home/user/project"
+                  value={planFolderPathInput}
+                  onChange={(e) => setPlanFolderPathInput(e.target.value)}
+                />
+                <input
+                  className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-20 text-center bg-white dark:bg-zinc-900"
+                  placeholder="777"
+                  value={planFolderPermInput}
+                  onChange={(e) => setPlanFolderPermInput(e.target.value)}
+                />
+                <AppButton type="button" size="xs" onClick={() => void pickPlanFolderPath()}>
+                  选择文件夹
+                </AppButton>
+                <AppButton type="button" size="xs" variant="info" onClick={addPlanFolderAuth}>
+                  添加授权
+                </AppButton>
+              </div>
+              <div className="mt-2 flex items-center gap-2 flex-wrap">
+                {planFolderAuths.length === 0 ? (
+                  <div className="text-xs text-zinc-400">none</div>
+                ) : (
+                  planFolderAuths.map((item) => (
+                    <div
+                      key={`${item.path}-${item.permission}`}
+                      className="text-xs border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 flex items-center gap-1"
+                    >
+                      <span>{item.path}</span>
+                      <span className="text-zinc-500">({item.permission})</span>
+                      <AppButton type="button" size="xs" variant="danger" onClick={() => removePlanFolderAuth(item.path)}>
+                        x
+                      </AppButton>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+            {pendingPlan.installRequired ? (
+              <label className="mt-2 flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={autoInstallMissing}
+                  onChange={(e) => setAutoInstallMissing(e.target.checked)}
+                />
+                确认后自动安装缺失 skills（仅白名单）
+              </label>
+            ) : null}
+            <div className="mt-3 flex items-center gap-2">
+              {pendingApprovalStepId ? (
+                <>
+                  <AppButton
+                    type="button"
+                    size="md"
+                    variant="info"
+                    onClick={() => {
+                      setStepApprovals((prev) => ({ ...prev, [pendingApprovalStepId]: true }));
+                      void confirmAndExecute();
+                    }}
+                    disabled={loading}
+                  >
+                    同意 {pendingApprovalStepId} 并继续执行
+                  </AppButton>
+                  <AppButton
+                    type="button"
+                    size="md"
+                    variant="danger"
+                    onClick={() => {
+                      setPendingApprovalStepId(null);
+                      setMessages((prev) => [...prev, { role: "assistant", content: `已拒绝步骤 ${pendingApprovalStepId}，执行终止。` }]);
+                    }}
+                    disabled={loading}
+                  >
+                    拒绝并终止
+                  </AppButton>
+                </>
+              ) : null}
+              {pendingPlan.executionMode === "user_exec" ? (
+                <AppButton type="button" size="md" variant="info" onClick={continueChatWithChecklist}>
+                  按选中 checklist 继续对话
+                </AppButton>
+              ) : (
+                <AppButton type="button" size="md" variant="success" onClick={() => void confirmAndExecute()} disabled={loading}>
+                  确认执行
+                </AppButton>
+              )}
+              <AppButton type="button" size="md" onClick={cancelPlan} disabled={loading}>
+                取消
+              </AppButton>
+              <AppButton
+                type="button"
+                onClick={() =>
+                  openTaskFlow(
+                    {
+                      title: `${pendingPlan.query} (可编辑)`,
+                      mode: pendingPlan.mode,
+                      lines: buildConfirmedPlanLines(pendingPlan.lines),
+                      skills: pendingPlan.recommendedSkills,
+                    },
+                    true
+                  )
+                }
+                size="md"
+                variant="info"
+              >
+                Task Flow
+              </AppButton>
+            </div>
+          </div>
+        ) : null}
+
+        </section>
+      </main>
+      <TaskFlowModal
+        open={flowOpen}
+        title={flowTitle}
+        editable={flowEditable}
+        nodes={flowNodes}
+        edges={flowEdges}
+        onClose={() => setFlowOpen(false)}
+        onNodesChange={onFlowNodesChange}
+        onEdgesChange={onFlowEdgesChange}
+        onConnect={onFlowConnect}
+        flowSkills={flowSkills}
+        flowSkillInput={flowSkillInput}
+        setFlowSkillInput={setFlowSkillInput}
+        addFlowSkill={addFlowSkill}
+        removeFlowSkill={removeFlowSkill}
+        flowFolderAuths={flowFolderAuths}
+        flowFolderPathInput={flowFolderPathInput}
+        setFlowFolderPathInput={setFlowFolderPathInput}
+        flowFolderPermInput={flowFolderPermInput}
+        setFlowFolderPermInput={setFlowFolderPermInput}
+        addFlowFolderAuth={addFlowFolderAuth}
+        removeFlowFolderAuth={removeFlowFolderAuth}
+        pickFolderPath={pickFolderPath}
+      />
+      <style jsx global>{`
+        .task-flow-modal .react-flow__controls-button {
+          background: #f3e2b3;
+          color: #7a5a1f;
+          border-bottom: 1px solid #d6b36a;
+        }
+        .task-flow-modal .react-flow__controls-button:hover {
+          background: #ead39a;
+        }
+      `}</style>
+      <CapabilityModal
+        open={capabilityOpen}
+        onClose={() => setCapabilityOpen(false)}
+        capabilityTab={capabilityTab}
+        setCapabilityTab={setCapabilityTab}
+        capabilityQuery={capabilityQuery}
+        setCapabilityQuery={setCapabilityQuery}
+        loadCapabilities={loadCapabilities}
+        capabilityAgents={capabilityAgents}
+        capabilitySkills={capabilitySkills}
+        installSkill={installSkill}
+        toggleWhitelist={toggleWhitelist}
+        capabilityPage={capabilityPage}
+        capabilitySkillsTotal={capabilitySkillsTotal}
+        capabilityPageSize={capabilityPageSize}
+        onlineQuery={onlineQuery}
+        setOnlineQuery={setOnlineQuery}
+        searchOnlineSkills={searchOnlineSkills}
+        onlineSkills={onlineSkills}
+        addOnlineSkill={addOnlineSkill}
+        newAgentId={newAgentId}
+        setNewAgentId={setNewAgentId}
+        newAgentLabel={newAgentLabel}
+        setNewAgentLabel={setNewAgentLabel}
+        newAgentDescription={newAgentDescription}
+        setNewAgentDescription={setNewAgentDescription}
+        createCustomAgent={createCustomAgent}
+        customAgents={customAgents}
+        deleteCustomAgent={deleteCustomAgent}
+        personalSkillRootPath={personalSkillRootPath}
+        personalSkillPathInput={personalSkillPathInput}
+        setPersonalSkillPathInput={setPersonalSkillPathInput}
+        savePersonalSkillPath={savePersonalSkillPath}
+        loadPersonalSkillTree={loadPersonalSkillTree}
+        pickPersonalSkillPath={pickPersonalSkillPath}
+        personalSkillItems={personalSkillItems}
+      />
+      <DeepseekModal
+        open={deepseekOpen}
+        onClose={() => setDeepseekOpen(false)}
+        deepseekConfig={deepseekConfig}
+        setDeepseekConfig={setDeepseekConfig}
+      />
+      <PlanRecordModal
+        open={planRecordOpen}
+        onClose={() => setPlanRecordOpen(false)}
+        planRecordSearch={planRecordSearch}
+        setPlanRecordSearch={setPlanRecordSearch}
+        filteredPlanRecords={filteredPlanRecords}
+        setSelectedPlanRecord={setSelectedPlanRecord}
+        loadHistoryPlan={loadHistoryPlan}
+        executePlanItem={executePlanItem}
+        openTaskFlow={openTaskFlow}
+        toggleFavorite={toggleFavorite}
+        deletePlanItem={deletePlanItem}
+      />
+      <PlanDetailModal
+        selectedPlanRecord={selectedPlanRecord}
+        setSelectedPlanRecord={setSelectedPlanRecord}
+        openTaskFlow={openTaskFlow}
+      />
+    </div>
+  );
+}

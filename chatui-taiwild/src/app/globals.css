@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --z-base: 0;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-overlay: 1000;
+  --z-modal: 1100;
+  --z-toast: 1200;
+  --z-tooltip: 1300;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+@layer utilities {
+  .z-base {
+    z-index: var(--z-base);
+  }
+  .z-dropdown {
+    z-index: var(--z-dropdown);
+  }
+  .z-sticky {
+    z-index: var(--z-sticky);
+  }
+  .z-overlay {
+    z-index: var(--z-overlay);
+  }
+  .z-modal {
+    z-index: var(--z-modal);
+  }
+  .z-toast {
+    z-index: var(--z-toast);
+  }
+  .z-tooltip {
+    z-index: var(--z-tooltip);
+  }
+}

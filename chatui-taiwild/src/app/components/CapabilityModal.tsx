@@ -1,0 +1,265 @@
+"use client";
+
+import AppButton from "@/components/ui/AppButton";
+import AppModal from "@/components/ui/AppModal";
+import type { CapabilityAgent, CapabilitySkill } from "@/app/components/modalTypes";
+
+type Props = {
+  open: boolean;
+  onClose: () => void;
+  capabilityTab: "existing" | "add";
+  setCapabilityTab: (tab: "existing" | "add") => void;
+  capabilityQuery: string;
+  setCapabilityQuery: (value: string) => void;
+  loadCapabilities: (keyword?: string, page?: number) => Promise<void>;
+  capabilityAgents: CapabilityAgent[];
+  capabilitySkills: CapabilitySkill[];
+  installSkill: (skillId: string) => Promise<void>;
+  toggleWhitelist: (skillId: string, enabled: boolean) => Promise<void>;
+  capabilityPage: number;
+  capabilitySkillsTotal: number;
+  capabilityPageSize: number;
+  onlineQuery: string;
+  setOnlineQuery: (value: string) => void;
+  searchOnlineSkills: () => Promise<void>;
+  onlineSkills: CapabilitySkill[];
+  addOnlineSkill: (skillId: string) => Promise<void>;
+  newAgentId: string;
+  setNewAgentId: (value: string) => void;
+  newAgentLabel: string;
+  setNewAgentLabel: (value: string) => void;
+  newAgentDescription: string;
+  setNewAgentDescription: (value: string) => void;
+  createCustomAgent: () => Promise<void>;
+  customAgents: CapabilityAgent[];
+  deleteCustomAgent: (agentId: string) => Promise<void>;
+  personalSkillRootPath: string;
+  personalSkillPathInput: string;
+  setPersonalSkillPathInput: (value: string) => void;
+  savePersonalSkillPath: () => Promise<void>;
+  loadPersonalSkillTree: () => Promise<void>;
+  pickPersonalSkillPath: () => void | Promise<void>;
+  personalSkillItems: Array<{ type: "dir" | "md"; path: string }>;
+};
+
+export default function CapabilityModal(props: Props) {
+  if (!props.open) return null;
+  return (
+    <AppModal panelClassName="w-full max-w-4xl h-[76vh] bg-white dark:bg-zinc-900 rounded border border-zinc-300 dark:border-zinc-700 flex flex-col">
+      <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-700 flex items-center gap-2">
+        <div className="font-medium flex-1">可用 Agent / Skill</div>
+        <div className="flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded p-0.5">
+          <AppButton
+            type="button"
+            size="xs"
+            variant="tab"
+            className={props.capabilityTab === "existing" ? "bg-zinc-200 dark:bg-zinc-700" : ""}
+            onClick={() => props.setCapabilityTab("existing")}
+          >
+            已有列表
+          </AppButton>
+          <AppButton
+            type="button"
+            size="xs"
+            variant="tab"
+            className={props.capabilityTab === "add" ? "bg-zinc-200 dark:bg-zinc-700" : ""}
+            onClick={() => props.setCapabilityTab("add")}
+          >
+            添加
+          </AppButton>
+        </div>
+        {props.capabilityTab === "existing" ? (
+          <>
+            <input
+              className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-sm"
+              placeholder="search agent/skill..."
+              value={props.capabilityQuery}
+              onChange={(e) => props.setCapabilityQuery(e.target.value)}
+            />
+            <AppButton type="button" size="xs" onClick={() => void props.loadCapabilities(props.capabilityQuery, 1)}>
+              Search
+            </AppButton>
+          </>
+        ) : null}
+        <AppButton type="button" onClick={props.onClose}>
+          关闭
+        </AppButton>
+      </div>
+      {props.capabilityTab === "existing" ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 overflow-auto">
+          <div>
+            <div className="text-sm font-medium mb-2">Agents</div>
+            <div className="space-y-2">
+              {props.capabilityAgents.map((a) => (
+                <div key={a.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2">
+                  <div className="text-sm font-medium">{a.label}</div>
+                  <div className="text-xs text-zinc-500">{a.description}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-sm font-medium mb-2">Skills</div>
+            <div className="space-y-2">
+              {props.capabilitySkills.map((s) => (
+                <div key={s.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2">
+                  <div className="text-sm font-medium">{s.name}</div>
+                  <div className="text-xs text-zinc-500">
+                    {s.source} | {s.installed ? "installed" : "not installed"}
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <AppButton type="button" size="xs" onClick={() => void props.installSkill(s.id)} disabled={s.installed}>
+                      下载/安装
+                    </AppButton>
+                    <label className="text-xs flex items-center gap-1">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(s.whitelisted)}
+                        onChange={(e) => void props.toggleWhitelist(s.id, e.target.checked)}
+                      />
+                      whitelist
+                    </label>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
+              <div>
+                page {props.capabilityPage} / {Math.max(1, Math.ceil(props.capabilitySkillsTotal / props.capabilityPageSize))}
+              </div>
+              <div className="flex items-center gap-2">
+                <AppButton
+                  type="button"
+                  size="xs"
+                  disabled={props.capabilityPage <= 1}
+                  onClick={() => void props.loadCapabilities(props.capabilityQuery, props.capabilityPage - 1)}
+                >
+                  Prev
+                </AppButton>
+                <AppButton
+                  type="button"
+                  size="xs"
+                  disabled={props.capabilityPage * props.capabilityPageSize >= props.capabilitySkillsTotal}
+                  onClick={() => void props.loadCapabilities(props.capabilityQuery, props.capabilityPage + 1)}
+                >
+                  Next
+                </AppButton>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="p-4 overflow-auto">
+          <div className="text-xs text-zinc-500 mb-2">
+            ClawHub（OpenClaw 公共 skill 注册表，向量检索）— 由后端代理{" "}
+            <code className="text-[10px]">GET /v1/clawhub/search</code>，只读搜索无需 API Key；本机安装请使用官方{" "}
+            <code className="text-[10px]">clawhub install &lt;slug&gt;</code>。
+          </div>
+          <div className="flex items-center gap-2 mb-3">
+            <input
+              className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-sm flex-1"
+              placeholder="搜索 ClawHub skills（自然语言）..."
+              value={props.onlineQuery}
+              onChange={(e) => props.setOnlineQuery(e.target.value)}
+            />
+            <AppButton type="button" size="xs" onClick={() => void props.searchOnlineSkills()}>
+              Search ClawHub
+            </AppButton>
+          </div>
+          <div className="space-y-2">
+            {props.onlineSkills.map((s) => (
+              <div key={s.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2">
+                <div className="text-sm font-medium">{s.name}</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-400 font-mono">{s.id}</div>
+                {s.summary ? <div className="text-xs text-zinc-500 mt-1 line-clamp-3">{s.summary}</div> : null}
+                <div className="text-xs text-zinc-500">
+                  {s.source} | {s.installed ? "installed" : "not installed"}
+                  {typeof s.score === "number" ? ` | score ${s.score.toFixed(2)}` : ""}
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <AppButton type="button" size="xs" onClick={() => void props.addOnlineSkill(s.id)}>
+                    加入已有列表
+                  </AppButton>
+                </div>
+              </div>
+            ))}
+            {props.onlineSkills.length === 0 ? (
+              <div className="text-xs text-zinc-500">输入关键词后搜索 ClawHub（需本机可访问 clawhub.ai）。</div>
+            ) : null}
+          </div>
+          <div className="mt-6 border-t border-zinc-200 dark:border-zinc-700 pt-4">
+            <div className="text-sm font-medium mb-2">自建 Agent 注册中心</div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-2">
+              <input
+                className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-sm"
+                placeholder="agent id"
+                value={props.newAgentId}
+                onChange={(e) => props.setNewAgentId(e.target.value)}
+              />
+              <input
+                className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-sm"
+                placeholder="label"
+                value={props.newAgentLabel}
+                onChange={(e) => props.setNewAgentLabel(e.target.value)}
+              />
+              <input
+                className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-sm"
+                placeholder="description"
+                value={props.newAgentDescription}
+                onChange={(e) => props.setNewAgentDescription(e.target.value)}
+              />
+            </div>
+            <AppButton type="button" size="xs" onClick={() => void props.createCustomAgent()}>
+              添加自建 Agent
+            </AppButton>
+            <div className="mt-3 space-y-2">
+              {props.customAgents.map((a) => (
+                <div key={a.id} className="border border-zinc-200 dark:border-zinc-700 rounded p-2">
+                  <div className="text-sm font-medium">{a.label}</div>
+                  <div className="text-xs text-zinc-500">{a.id}</div>
+                  <div className="text-xs text-zinc-500">{a.description}</div>
+                  <AppButton type="button" size="xs" variant="danger" className="mt-1" onClick={() => void props.deleteCustomAgent(a.id)}>
+                    删除
+                  </AppButton>
+                </div>
+              ))}
+              {props.customAgents.length === 0 ? <div className="text-xs text-zinc-500">暂无自建 agent。</div> : null}
+            </div>
+          </div>
+          <div className="mt-6 border-t border-zinc-200 dark:border-zinc-700 pt-4">
+            <div className="text-sm font-medium mb-2">个人能力技能树（本地 Markdown）</div>
+            <div className="text-xs text-zinc-500 mb-2">当前路径: {props.personalSkillRootPath || "-"}</div>
+            <div className="flex items-center gap-2 mb-2">
+              <input
+                className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-sm flex-1"
+                placeholder="/Users/you/personal-skills"
+                value={props.personalSkillPathInput}
+                onChange={(e) => props.setPersonalSkillPathInput(e.target.value)}
+              />
+              <AppButton type="button" size="xs" onClick={props.pickPersonalSkillPath}>
+                选择路径
+              </AppButton>
+              <AppButton type="button" size="xs" variant="info" onClick={() => void props.savePersonalSkillPath()}>
+                保存路径
+              </AppButton>
+              <AppButton type="button" size="xs" onClick={() => void props.loadPersonalSkillTree()}>
+                刷新
+              </AppButton>
+            </div>
+            <div className="max-h-36 overflow-auto border border-zinc-200 dark:border-zinc-700 rounded p-2 space-y-1">
+              {props.personalSkillItems.length === 0 ? (
+                <div className="text-xs text-zinc-500">暂无 md 文件，往该目录添加 Markdown 即可。</div>
+              ) : (
+                props.personalSkillItems.map((item) => (
+                  <div key={`${item.type}-${item.path}`} className="text-xs text-zinc-600 dark:text-zinc-300">
+                    {item.type === "dir" ? "📁" : "📄"} {item.path}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </AppModal>
+  );
+}
