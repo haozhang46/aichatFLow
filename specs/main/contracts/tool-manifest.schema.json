@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aichatflow.local/schemas/tool-manifest.schema.json",
+  "title": "ToolManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "description",
+    "version",
+    "kind",
+    "inputSchema"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["builtin", "http", "file", "mcp", "workflow"]
+    },
+    "category": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "inputSchema": {
+      "type": "object"
+    },
+    "outputSchema": {
+      "type": "object"
+    },
+    "uiSchema": {
+      "type": "object"
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["public", "user", "admin", "service"]
+        },
+        "requiresCookie": {
+          "type": "boolean"
+        }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowAgents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "requiredPermissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "riskLevel": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["core", "tool-pack", "custom"]
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "registered", "published", "disabled", "deprecated"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "http"
+          }
+        },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["endpoint"]
+      }
+    }
+  ]
+}

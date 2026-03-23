@@ -8,6 +8,7 @@ from app.contracts.otie import ExecutionPlan, IntentEnvelope, PlanStep, RunResul
 from app.observability.otie_trace_service import OtieTraceService
 from app.orchestrator.graph import run_orchestrator
 from app.policy.runtime_policy import RuntimePolicyService
+from app.services.platform_trace_service import PlatformTraceService
 from app.services.schema_validation import validate_against_schema, validate_llm_text_against_schema
 from app.tools.registry import ToolRegistry
 
@@ -25,10 +26,12 @@ class OtieRuntime:
         tool_registry: ToolRegistry,
         policy_service: RuntimePolicyService,
         trace_service: OtieTraceService,
+        platform_trace_service: PlatformTraceService,
     ) -> None:
         self._tool_registry = tool_registry
         self._policy_service = policy_service
         self._trace_service = trace_service
+        self._platform_trace_service = platform_trace_service
 
     async def run(
         self,
@@ -40,9 +43,24 @@ class OtieRuntime:
         approvals = step_approvals or {}
         run_id = f"run_{uuid4().hex[:12]}"
         memory = WorkingMemory()
+        self._platform_trace_service.emit(
+            run_id,
+            "run_started",
+            run_id=run_id,
+            span_id=self._platform_trace_service.new_span_id("run"),
+            status="running",
+            agentId=plan.mode,
+            userId=str(intent.metadata.get("currentUserId") or "").strip(),
+            metadata={"requestId": intent.request_id, "tenantId": intent.tenant_id},
+        )
 
         self._trace_service.start_run(run_id, intent, plan)
         self._trace_service.append_event(run_id, "state_transition", fromState="pending", toState="running")
+        allowed_tool_ids = [
+            str(item).strip()
+            for item in (intent.metadata.get("allowedToolIds") or [])
+            if str(item).strip()
+        ]
 
         for index, step in enumerate(plan.steps):
             if index >= plan.max_steps:
@@ -76,7 +94,7 @@ class OtieRuntime:
                 action=step.action,
             )
 
-            policy = self._policy_service.evaluate(step, approvals)
+            policy = self._policy_service.evaluate(step, approvals, allowed_tool_ids=allowed_tool_ids)
             self._trace_service.append_event(run_id, "policy_evaluated", stepId=step.id, **policy)
             if not policy.get("allow"):
                 message = "Execution paused: user approval is required for this step."
@@ -161,6 +179,16 @@ class OtieRuntime:
             final_answer=final_answer,
             step_outputs=memory.step_outputs,
         )
+        self._platform_trace_service.emit(
+            run_id,
+            "run_completed",
+            run_id=run_id,
+            span_id=self._platform_trace_service.new_span_id("run"),
+            status="success",
+            agentId=plan.mode,
+            userId=str(intent.metadata.get("currentUserId") or "").strip(),
+            metadata={"finalAnswerPreview": final_answer[:500]},
+        )
         run = self._trace_service.get_run(run_id) or {}
         return RunResult(
             runId=run_id,
@@ -195,6 +223,22 @@ class OtieRuntime:
                     topK=step.tool_args.get("topK"),
                     minScore=step.tool_args.get("minScore"),
                 )
+            if step.tool_id == "web-fetch":
+                self._trace_service.append_event(
+                    run_id,
+                    "web_fetch_started",
+                    stepId=step.id,
+                    url=step.tool_args.get("url"),
+                    maxChars=step.tool_args.get("maxChars"),
+                )
+            tool_context = {
+                "currentUserId": str(intent.metadata.get("currentUserId") or "").strip(),
+                "traceId": run_id,
+                "parentSpanId": step.id,
+                "traceSource": "otie_runtime",
+                "currentAgentId": str(intent.metadata.get("agentId") or "").strip(),
+                "allowedToolIds": intent.metadata.get("allowedToolIds"),
+            }
             self._trace_service.append_event(
                 run_id,
                 "tool_call",
@@ -202,7 +246,7 @@ class OtieRuntime:
                 toolId=step.tool_id,
                 args=step.tool_args,
             )
-            output = await self._tool_registry.execute(step.tool_id, step.tool_args)
+            output = await self._tool_registry.execute(step.tool_id, step.tool_args, context=tool_context)
             if step.tool_id == "retrieval" and isinstance(output, dict):
                 hits = output.get("hits") or []
                 self._trace_service.append_event(
@@ -228,6 +272,17 @@ class OtieRuntime:
                             if isinstance(item, dict)
                         ],
                     )
+            if step.tool_id == "web-fetch" and isinstance(output, dict):
+                self._trace_service.append_event(
+                    run_id,
+                    "web_fetch_completed",
+                    stepId=step.id,
+                    url=output.get("url"),
+                    finalUrl=output.get("finalUrl"),
+                    statusCode=output.get("statusCode"),
+                    title=output.get("title"),
+                    contentLength=len(str(output.get("content") or "")),
+                )
             return self._validate_step_output(run_id, intent, step, output)
 
         if step.kind == "reason":
@@ -386,6 +441,16 @@ class OtieRuntime:
         status: str,
         message: str,
     ) -> RunResult:
+        self._platform_trace_service.emit(
+            run_id,
+            "run_completed",
+            run_id=run_id,
+            span_id=self._platform_trace_service.new_span_id("run"),
+            status="failed" if status == "failed" else "awaiting_approval",
+            agentId=plan.mode,
+            userId=str(intent.metadata.get("currentUserId") or "").strip(),
+            metadata={"finalAnswerPreview": message[:500]},
+        )
         self._trace_service.finish_run(
             run_id,
             status=status,

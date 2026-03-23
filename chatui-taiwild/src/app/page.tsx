@@ -18,6 +18,8 @@ import PlanRecordModal from "@/app/components/PlanRecordModal";
 import PlanDetailModal from "@/app/components/PlanDetailModal";
 import RagViewerModal from "@/app/components/RagViewerModal";
 import SettingsModal from "@/app/components/SettingsModal";
+import AgentPlaygroundModal from "@/app/components/AgentPlaygroundModal";
+import ToolPlaygroundModal from "@/app/components/ToolPlaygroundModal";
 import TraceModal from "@/app/components/TraceModal";
 import type {
   Strategy,
@@ -63,7 +65,7 @@ type CapabilityAgent = {
   id: string;
   label: string;
   description: string;
-  source?: string;
+  source?: string | { type?: string; path?: string };
 };
 
 type CapabilitySkill = {
@@ -90,6 +92,17 @@ type CapabilityTool = {
   builtin?: boolean;
   allowlisted?: boolean;
   denylisted?: boolean;
+  inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  exampleArgs?: Record<string, unknown>;
+  requiredUserInputs?: Array<{
+    key: string;
+    label: string;
+    type?: "text" | "password" | "textarea";
+    required?: boolean;
+    secret?: boolean;
+    placeholder?: string;
+  }>;
 };
 
 type FlowSource = {
@@ -141,13 +154,25 @@ type RagGraph = {
   edges: Array<{ id: string; source: string; target: string }>;
 };
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:3000";
+const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 const PLAN_HISTORY_KEY = "aichatflow.planHistory.v1";
 const PLAN_EXPANDED_KEY = "aichatflow.planExpanded.v1";
 const DEEPSEEK_CONFIG_KEY = "aichatflow.deepseek.config.v1";
 
 function newRequestId() {
   return `req_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function dedupeAgentsById(items: CapabilityAgent[]): CapabilityAgent[] {
+  const seen = new Set<string>();
+  const result: CapabilityAgent[] = [];
+  for (const item of items) {
+    const id = String(item.id || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    result.push(item);
+  }
+  return result;
 }
 
 function normalizeClawhubSuggestions(raw: unknown): ClawhubPlanSuggestion[] {
@@ -242,6 +267,7 @@ export default function Home() {
   const [selectedPlanBranch, setSelectedPlanBranch] = useState<Record<number, Record<string, string>>>({});
   const [planBranchInput, setPlanBranchInput] = useState<Record<string, string>>({});
   const [stepExecutionConfigs, setStepExecutionConfigs] = useState<Record<number, StepExecutionConfig>>({});
+  const [stepToolInputs, setStepToolInputs] = useState<Record<number, Record<string, Record<string, string>>>>({});
   const [executionChecklist, setExecutionChecklist] = useState<ExecutionChecklistItem[]>([]);
   const [executionStepStates, setExecutionStepStates] = useState<Record<string, StepRunState>>({});
   const [stepApprovals, setStepApprovals] = useState<Record<string, boolean>>({});
@@ -265,19 +291,26 @@ export default function Home() {
   const [capabilityAgents, setCapabilityAgents] = useState<CapabilityAgent[]>([]);
   const [capabilitySkills, setCapabilitySkills] = useState<CapabilitySkill[]>([]);
   const [capabilityTools, setCapabilityTools] = useState<CapabilityTool[]>([]);
+  const [capabilityLoading, setCapabilityLoading] = useState(false);
+  const [capabilityInstallingSkillId, setCapabilityInstallingSkillId] = useState<string | null>(null);
+  const [capabilityTogglingWhitelistSkillId, setCapabilityTogglingWhitelistSkillId] = useState<string | null>(null);
+  const [capabilityTogglingToolPolicyKey, setCapabilityTogglingToolPolicyKey] = useState<string | null>(null);
   const [capabilityWhitelist, setCapabilityWhitelist] = useState<string[]>([]);
   const [personalSkillRootPath, setPersonalSkillRootPath] = useState("");
   const [personalSkillPathInput, setPersonalSkillPathInput] = useState("");
   const [personalSkillItems, setPersonalSkillItems] = useState<Array<{ type: "dir" | "md"; path: string }>>([]);
+  const [personalSkillTreeLoading, setPersonalSkillTreeLoading] = useState(false);
+  const [personalSkillPathSaving, setPersonalSkillPathSaving] = useState(false);
   const [capabilityPage, setCapabilityPage] = useState(1);
   const [capabilityPageSize] = useState(8);
   const [capabilitySkillsTotal, setCapabilitySkillsTotal] = useState(0);
   const [onlineQuery, setOnlineQuery] = useState("");
   const [onlineSkills, setOnlineSkills] = useState<CapabilitySkill[]>([]);
+  const [onlineSkillsLoading, setOnlineSkillsLoading] = useState(false);
+  const [onlineAddingSkillId, setOnlineAddingSkillId] = useState<string | null>(null);
   const [customAgents, setCustomAgents] = useState<CapabilityAgent[]>([]);
-  const [newAgentId, setNewAgentId] = useState("");
-  const [newAgentLabel, setNewAgentLabel] = useState("");
-  const [newAgentDescription, setNewAgentDescription] = useState("");
+  const [customAgentCreating, setCustomAgentCreating] = useState(false);
+  const [customAgentDeletingId, setCustomAgentDeletingId] = useState<string | null>(null);
   const [flowOpen, setFlowOpen] = useState(false);
   const [flowEditable, setFlowEditable] = useState(true);
   const [flowTitle, setFlowTitle] = useState("");
@@ -299,6 +332,18 @@ export default function Home() {
   const [traceViewerRun, setTraceViewerRun] = useState<Record<string, unknown> | null>(null);
   const [deepseekOpen, setDeepseekOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [toolPlaygroundOpen, setToolPlaygroundOpen] = useState(false);
+  const [toolPlaygroundToolId, setToolPlaygroundToolId] = useState("");
+  const [toolPlaygroundArgsText, setToolPlaygroundArgsText] = useState("{}");
+  const [toolPlaygroundLoading, setToolPlaygroundLoading] = useState(false);
+  const [toolPlaygroundResponse, setToolPlaygroundResponse] = useState<Record<string, unknown> | null>(null);
+  const [toolPlaygroundError, setToolPlaygroundError] = useState<string | null>(null);
+  const [agentPlaygroundOpen, setAgentPlaygroundOpen] = useState(false);
+  const [agentPlaygroundAgentId, setAgentPlaygroundAgentId] = useState("");
+  const [agentPlaygroundPrompt, setAgentPlaygroundPrompt] = useState("");
+  const [agentPlaygroundLoading, setAgentPlaygroundLoading] = useState(false);
+  const [agentPlaygroundResponse, setAgentPlaygroundResponse] = useState<Record<string, unknown> | null>(null);
+  const [agentPlaygroundError, setAgentPlaygroundError] = useState<string | null>(null);
   const [ragOpen, setRagOpen] = useState(false);
   const [ragLoading, setRagLoading] = useState(false);
   const [ragError, setRagError] = useState<string | null>(null);
@@ -363,6 +408,7 @@ export default function Home() {
     setSelectedPlanBranch({});
     setPlanBranchInput({});
     setStepExecutionConfigs({});
+    setStepToolInputs({});
     setExecutionChecklist([]);
     setExecutionStepStates({});
     setStepApprovals({});
@@ -414,15 +460,15 @@ export default function Home() {
                   : {},
               taskChecklist: Array.isArray(item.taskChecklist)
                 ? item.taskChecklist
-                    .map((x) => {
-                      const itemX = x as { id?: string; text?: string; done?: boolean };
-                      return {
-                        id: String(itemX?.id ?? `legacy_${Math.random().toString(16).slice(2)}`),
-                        text: String(itemX?.text ?? ""),
-                        done: Boolean(itemX?.done),
-                      };
-                    })
-                    .filter((x) => x.text.trim().length > 0)
+                  .map((x) => {
+                    const itemX = x as { id?: string; text?: string; done?: boolean };
+                    return {
+                      id: String(itemX?.id ?? `legacy_${Math.random().toString(16).slice(2)}`),
+                      text: String(itemX?.text ?? ""),
+                      done: Boolean(itemX?.done),
+                    };
+                  })
+                  .filter((x) => x.text.trim().length > 0)
                 : [],
               clawhubSuggestions: normalizeClawhubSuggestions(item.clawhubSuggestions),
               executionPlan: normalizeExecutionPlan(item.executionPlan, item.lines ?? [], (item.mode ?? "auto") as Strategy),
@@ -471,6 +517,24 @@ export default function Home() {
   }, [deepseekConfig]);
 
   useEffect(() => {
+    if (!toolPlaygroundOpen) return;
+    const tool = capabilityTools.find((item) => item.id === toolPlaygroundToolId);
+    if (!tool) return;
+    setToolPlaygroundArgsText(JSON.stringify(tool.exampleArgs ?? {}, null, 2));
+    setToolPlaygroundResponse(null);
+    setToolPlaygroundError(null);
+  }, [capabilityTools, toolPlaygroundOpen, toolPlaygroundToolId]);
+
+  useEffect(() => {
+    if (!agentPlaygroundOpen) return;
+    if (!agentPlaygroundPrompt.trim()) {
+      setAgentPlaygroundPrompt("Write a concise answer that demonstrates this agent's behavior.");
+    }
+    setAgentPlaygroundResponse(null);
+    setAgentPlaygroundError(null);
+  }, [agentPlaygroundOpen, agentPlaygroundAgentId]);
+
+  useEffect(() => {
     if (!pendingPlan || loading) return;
     const normalizedLines = pendingPlan.lines.map((x) => x.trim()).filter((x) => x.length > 0);
     if (normalizedLines.length === 0) return;
@@ -494,17 +558,100 @@ export default function Home() {
   }, [pendingPlan, loading]);
 
   async function loadCapabilities(keyword = "", page = 1) {
-    const qPart = keyword ? `q=${encodeURIComponent(keyword)}&` : "";
-    const qs = `?${qPart}page=${page}&pageSize=${capabilityPageSize}`;
-    const res = await fetch(`${apiBaseUrl}/v1/capabilities${qs}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data?.detail ?? "load capabilities failed");
-    setCapabilityAgents(Array.isArray(data?.agents) ? data.agents : []);
-    setCapabilitySkills(Array.isArray(data?.skills) ? data.skills : []);
-    setCapabilityTools(Array.isArray(data?.tools) ? data.tools : []);
-    setCapabilityWhitelist(Array.isArray(data?.whitelist) ? data.whitelist.map((x: unknown) => String(x)) : []);
-    setCapabilitySkillsTotal(Number(data?.skillsTotal ?? 0));
-    setCapabilityPage(Number(data?.page ?? page));
+    setCapabilityLoading(true);
+    try {
+      const qPart = keyword ? `q=${encodeURIComponent(keyword)}&` : "";
+      const qs = `?${qPart}page=${page}&pageSize=${capabilityPageSize}`;
+      const res = await fetch(`${apiBaseUrl}/v1/capabilities${qs}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.detail ?? "load capabilities failed");
+      setCapabilityAgents(Array.isArray(data?.agents) ? data.agents : []);
+      setCapabilitySkills(Array.isArray(data?.skills) ? data.skills : []);
+      setCapabilityTools(Array.isArray(data?.tools) ? data.tools : []);
+      setCapabilityWhitelist(Array.isArray(data?.whitelist) ? data.whitelist.map((x: unknown) => String(x)) : []);
+      setCapabilitySkillsTotal(Number(data?.skillsTotal ?? 0));
+      setCapabilityPage(Number(data?.page ?? page));
+    } finally {
+      setCapabilityLoading(false);
+    }
+  }
+
+  function openToolPlayground(initialToolId?: string) {
+    setToolPlaygroundError(null);
+    setToolPlaygroundResponse(null);
+    const fallbackToolId = initialToolId || capabilityTools[0]?.id || "";
+    setToolPlaygroundToolId(fallbackToolId);
+    const tool = capabilityTools.find((item) => item.id === fallbackToolId);
+    setToolPlaygroundArgsText(JSON.stringify(tool?.exampleArgs ?? {}, null, 2));
+    setToolPlaygroundOpen(true);
+  }
+
+  function openAgentPlayground(initialAgentId?: string) {
+    const availableAgents = dedupeAgentsById([...capabilityAgents, ...customAgents]);
+    const fallbackAgentId = initialAgentId || availableAgents[0]?.id || "agent";
+    setAgentPlaygroundAgentId(fallbackAgentId);
+    setAgentPlaygroundError(null);
+    setAgentPlaygroundResponse(null);
+    setAgentPlaygroundOpen(true);
+  }
+
+  async function invokeToolPlayground() {
+    if (!toolPlaygroundToolId) return;
+    setToolPlaygroundLoading(true);
+    setToolPlaygroundError(null);
+    setToolPlaygroundResponse(null);
+    try {
+      const args = JSON.parse(toolPlaygroundArgsText || "{}");
+      const res = await fetch(`${apiBaseUrl}/v1/otie/tools/${encodeURIComponent(toolPlaygroundToolId)}/invoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ args }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail ?? "tool invoke failed");
+      setToolPlaygroundResponse(data);
+      if (data?.status === "failed" && data?.error?.message) {
+        setToolPlaygroundError(String(data.error.message));
+      }
+    } catch (e: unknown) {
+      setToolPlaygroundError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setToolPlaygroundLoading(false);
+    }
+  }
+
+  async function invokeAgentPlayground() {
+    if (!agentPlaygroundAgentId) return;
+    setAgentPlaygroundLoading(true);
+    setAgentPlaygroundError(null);
+    setAgentPlaygroundResponse(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/agents/${encodeURIComponent(agentPlaygroundAgentId)}/invoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: agentPlaygroundPrompt,
+          llmConfig:
+            deepseekConfig.enabled && deepseekConfig.apiKey.trim()
+              ? {
+                provider: "deepseek",
+                apiKey: deepseekConfig.apiKey.trim(),
+                baseUrl: deepseekConfig.baseUrl.trim(),
+                model: deepseekConfig.model.trim(),
+              }
+              : null,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(typeof data?.detail === "string" ? data.detail : "Agent invoke failed");
+      }
+      setAgentPlaygroundResponse(data);
+    } catch (e: unknown) {
+      setAgentPlaygroundError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAgentPlaygroundLoading(false);
+    }
   }
 
   function buildRagInput() {
@@ -525,13 +672,11 @@ export default function Home() {
       const [scopesRes, docsRes, graphRes] = await Promise.all([
         fetch(`${apiBaseUrl}/v1/rag/scopes?tenantId=${encodeURIComponent(tenantId)}`),
         fetch(
-          `${apiBaseUrl}/v1/rag/documents?tenantId=${encodeURIComponent(tenantId)}${
-            scopeQuery ? `&scope=${encodeURIComponent(scopeQuery)}` : ""
+          `${apiBaseUrl}/v1/rag/documents?tenantId=${encodeURIComponent(tenantId)}${scopeQuery ? `&scope=${encodeURIComponent(scopeQuery)}` : ""
           }`
         ),
         fetch(
-          `${apiBaseUrl}/v1/rag/graph?tenantId=${encodeURIComponent(tenantId)}${
-            scopeQuery ? `&scope=${encodeURIComponent(scopeQuery)}` : ""
+          `${apiBaseUrl}/v1/rag/graph?tenantId=${encodeURIComponent(tenantId)}${scopeQuery ? `&scope=${encodeURIComponent(scopeQuery)}` : ""
           }`
         ),
       ]);
@@ -549,6 +694,39 @@ export default function Home() {
     } finally {
       setRagLoading(false);
     }
+  }
+
+  async function createRagScope(scope: string) {
+    const nextScope = scope.trim();
+    if (!nextScope) return;
+    setRagError(null);
+    const previousScopes = ragScopes;
+    const scopeAlreadyExists = previousScopes.includes(nextScope);
+    if (!scopeAlreadyExists) {
+      setRagScopes((prev) => [...prev, nextScope].sort((a, b) => a.localeCompare(b)));
+    }
+    setRagSelectedScope(nextScope);
+    setRagDocuments([]);
+    setRagGraph({ nodes: [], edges: [] });
+    const res = await fetch(`${apiBaseUrl}/v1/rag/scopes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenantId,
+        scope: nextScope,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = data?.detail ?? "create rag scope failed";
+      if (!scopeAlreadyExists) {
+        setRagScopes(previousScopes);
+      }
+      setRagSelectedScope("");
+      setRagError(message);
+      throw new Error(message);
+    }
+    await loadRagViewer(nextScope);
   }
 
   async function addRagDocument(payload: {
@@ -582,6 +760,108 @@ export default function Home() {
     await loadRagViewer(nextScope);
   }
 
+  async function updateRagDocument(payload: {
+    documentId: string;
+    scope: string;
+    title: string;
+    content: string;
+    source: string;
+    tags: string[];
+  }) {
+    setRagError(null);
+    const res = await fetch(`${apiBaseUrl}/v1/rag/documents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenantId,
+        documentId: payload.documentId,
+        scope: payload.scope,
+        title: payload.title,
+        content: payload.content,
+        source: payload.source,
+        tags: payload.tags,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = data?.detail ?? "update rag document failed";
+      setRagError(message);
+      throw new Error(message);
+    }
+    setRagSelectedScope(payload.scope.trim());
+    await loadRagViewer(payload.scope.trim());
+  }
+
+  async function deleteRagDocument(documentId: string) {
+    setRagError(null);
+    const res = await fetch(
+      `${apiBaseUrl}/v1/rag/documents/${encodeURIComponent(documentId)}?tenantId=${encodeURIComponent(tenantId)}`,
+      { method: "DELETE" }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = data?.detail ?? "delete rag document failed";
+      setRagError(message);
+      throw new Error(message);
+    }
+    await loadRagViewer();
+  }
+
+  async function batchIngestRag(payload: {
+    scope: string;
+    items: Array<{
+      scope?: string;
+      title?: string;
+      content?: string;
+      url?: string;
+      filePath?: string;
+      source?: string;
+      tags?: string[];
+    }>;
+  }) {
+    setRagError(null);
+    const res = await fetch(`${apiBaseUrl}/v1/rag/documents/batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenantId,
+        scope: payload.scope,
+        items: payload.items,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = data?.detail ?? "batch ingest failed";
+      setRagError(message);
+      throw new Error(message);
+    }
+    setRagSelectedScope(payload.scope.trim());
+    await loadRagViewer(payload.scope.trim());
+  }
+
+  async function uploadRagFiles(payload: { scope: string; files: File[]; tags: string[] }) {
+    setRagError(null);
+    const form = new FormData();
+    form.set("tenantId", tenantId);
+    form.set("scope", payload.scope);
+    form.set("tags", payload.tags.join(","));
+    for (const file of payload.files) {
+      form.append("files", file, file.name);
+    }
+    const res = await fetch(`${apiBaseUrl}/v1/rag/documents/upload`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = data?.detail ?? "upload rag files failed";
+      setRagError(message);
+      throw new Error(message);
+    }
+    setRagSelectedScope(payload.scope.trim());
+    await loadRagViewer(payload.scope.trim());
+  }
+
   async function loadCustomAgents() {
     const res = await fetch(`${apiBaseUrl}/v1/agents`);
     const data = await res.json();
@@ -590,14 +870,16 @@ export default function Home() {
   }
 
   async function loadPersonalSkillTree() {
-    const res = await fetch(`${apiBaseUrl}/v1/personal-skills/tree`);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.detail ?? "load personal skill tree failed");
-    }
-    const rootPath = typeof data?.rootPath === "string" ? data.rootPath : "";
-    const items = Array.isArray(data?.items)
-      ? data.items
+    setPersonalSkillTreeLoading(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/personal-skills/tree`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.detail ?? "load personal skill tree failed");
+      }
+      const rootPath = typeof data?.rootPath === "string" ? data.rootPath : "";
+      const items = Array.isArray(data?.items)
+        ? data.items
           .map((x: unknown) => {
             const item = x as { type?: string; path?: string };
             return {
@@ -606,74 +888,95 @@ export default function Home() {
             };
           })
           .filter((x: { path: string }) => x.path.length > 0)
-      : [];
-    setPersonalSkillRootPath(rootPath);
-    setPersonalSkillPathInput(rootPath || personalSkillPathInput);
-    setPersonalSkillItems(items);
+        : [];
+      setPersonalSkillRootPath(rootPath);
+      setPersonalSkillPathInput(rootPath || personalSkillPathInput);
+      setPersonalSkillItems(items);
+    } finally {
+      setPersonalSkillTreeLoading(false);
+    }
   }
 
-  async function savePersonalSkillPath() {
-    const path = personalSkillPathInput.trim();
+  async function savePersonalSkillPath(pathInput: string) {
+    const path = pathInput.trim();
     if (!path) return;
-    const res = await fetch(`${apiBaseUrl}/v1/personal-skills/path`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "save personal skill path failed");
-      return;
+    setPersonalSkillPathSaving(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/personal-skills/path`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "save personal skill path failed");
+        return;
+      }
+      setPersonalSkillPathInput(path);
+      setPersonalSkillRootPath(typeof data?.rootPath === "string" ? data.rootPath : path);
+      setPersonalSkillItems(Array.isArray(data?.items) ? data.items : []);
+      setMessages((prev) => [...prev, { role: "assistant", content: "个人技能树路径已更新。" }]);
+    } finally {
+      setPersonalSkillPathSaving(false);
     }
-    setPersonalSkillRootPath(typeof data?.rootPath === "string" ? data.rootPath : path);
-    setPersonalSkillItems(Array.isArray(data?.items) ? data.items : []);
-    setMessages((prev) => [...prev, { role: "assistant", content: "个人技能树路径已更新。" }]);
   }
 
   async function pickPersonalSkillPath() {
     const picker = (window as Window & { showDirectoryPicker?: () => Promise<{ name?: string }> }).showDirectoryPicker;
-    if (!picker) return;
+    if (!picker) return "";
     try {
       const handle = await picker();
       if (handle?.name) {
         setPersonalSkillPathInput(handle.name);
+        return handle.name;
       }
     } catch {
       // User canceled directory picker.
     }
+    return "";
   }
 
   async function installSkill(skillId: string) {
-    const res = await fetch(`${apiBaseUrl}/v1/capabilities/install`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ skillId }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "install failed");
-      return;
+    setCapabilityInstallingSkillId(skillId);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/capabilities/install`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skillId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "install failed");
+        return;
+      }
+      setMessages((prev) => [...prev, { role: "assistant", content: data?.message ?? "安装成功" }]);
+      await loadCapabilities(capabilityQuery, capabilityPage);
+    } finally {
+      setCapabilityInstallingSkillId(null);
     }
-    setMessages((prev) => [...prev, { role: "assistant", content: data?.message ?? "安装成功" }]);
-    await loadCapabilities(capabilityQuery, capabilityPage);
   }
 
   async function toggleWhitelist(skillId: string, enabled: boolean) {
-    const res = await fetch(`${apiBaseUrl}/v1/capabilities/whitelist`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ skillId, enabled }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "set whitelist failed");
-      return;
+    setCapabilityTogglingWhitelistSkillId(skillId);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/capabilities/whitelist`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skillId, enabled }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "set whitelist failed");
+        return;
+      }
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Whitelist updated: ${data?.skillId} -> ${data?.enabled}` },
+      ]);
+      await loadCapabilities(capabilityQuery, capabilityPage);
+    } finally {
+      setCapabilityTogglingWhitelistSkillId(null);
     }
-    setMessages((prev) => [
-      ...prev,
-      { role: "assistant", content: `Whitelist updated: ${data?.skillId} -> ${data?.enabled}` },
-    ]);
-    await loadCapabilities(capabilityQuery, capabilityPage);
   }
 
   async function toggleToolPolicy(
@@ -681,96 +984,119 @@ export default function Home() {
     field: "allowlisted" | "denylisted",
     enabled: boolean
   ) {
-    const res = await fetch(`${apiBaseUrl}/v1/capabilities/tools/policy`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ toolId, [field]: enabled }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "set tool policy failed");
-      return;
+    const actionKey = `${toolId}:${field}`;
+    setCapabilityTogglingToolPolicyKey(actionKey);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/capabilities/tools/policy`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ toolId, [field]: enabled }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "set tool policy failed");
+        return;
+      }
+      await loadCapabilities(capabilityQuery, capabilityPage);
+    } finally {
+      setCapabilityTogglingToolPolicyKey(null);
     }
-    await loadCapabilities(capabilityQuery, capabilityPage);
   }
 
   async function searchOnlineSkills() {
-    const res = await fetch(`${apiBaseUrl}/v1/clawhub/search?q=${encodeURIComponent(onlineQuery)}&limit=25`);
-    const data = await res.json();
-    if (!res.ok) {
-      setError(data?.detail ?? "ClawHub search failed");
-      return;
+    setOnlineSkillsLoading(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/clawhub/search?q=${encodeURIComponent(onlineQuery)}&limit=25`);
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data?.detail ?? "ClawHub search failed");
+        return;
+      }
+      setOnlineSkills(Array.isArray(data?.items) ? data.items : []);
+    } finally {
+      setOnlineSkillsLoading(false);
     }
-    setOnlineSkills(Array.isArray(data?.items) ? data.items : []);
   }
 
   async function addOnlineSkill(skillId: string) {
-    const res = await fetch(`${apiBaseUrl}/v1/clawhub/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slug: skillId }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "add online skill failed");
-      return;
+    setOnlineAddingSkillId(skillId);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/clawhub/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: skillId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "add online skill failed");
+        return;
+      }
+      setMessages((prev) => [...prev, { role: "assistant", content: data?.message ?? "已加入列表" }]);
+      await loadCapabilities(capabilityQuery, 1);
+    } finally {
+      setOnlineAddingSkillId(null);
     }
-    setMessages((prev) => [...prev, { role: "assistant", content: data?.message ?? "已加入列表" }]);
-    await loadCapabilities(capabilityQuery, 1);
   }
 
-  async function createCustomAgent() {
-    const res = await fetch(`${apiBaseUrl}/v1/agents`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentId: newAgentId,
-        label: newAgentLabel,
-        description: newAgentDescription,
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "create agent failed");
-      return;
+  async function createCustomAgent(payload: { agentId: string; label: string; description: string }) {
+    setCustomAgentCreating(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/agents`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentId: payload.agentId,
+          label: payload.label,
+          description: payload.description,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "create agent failed");
+        return;
+      }
+      const created = data?.agent as { id?: string; label?: string; description?: string } | undefined;
+      const createdId = created?.id ?? payload.agentId;
+      const createdLabel = created?.label ?? payload.label ?? createdId;
+      const createdDesc = created?.description ?? payload.description ?? "";
+      await loadCustomAgents();
+      await loadCapabilities(capabilityQuery, capabilityPage);
+      setCapabilityOpen(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            `已创建自建 Agent: ${createdLabel} (${createdId})\n` +
+            (createdDesc ? `描述: ${createdDesc}\n` : "") +
+            "初始 Plan:\n" +
+            "1. 识别并澄清用户目标\n" +
+            "2. 生成可执行步骤与所需 skill\n" +
+            "3. 等待用户确认后执行\n\n" +
+            "请继续输入你的意图（例如：帮我规划今天上海出行）。",
+        },
+      ]);
+      setInput("");
+    } finally {
+      setCustomAgentCreating(false);
     }
-    const created = data?.agent as { id?: string; label?: string; description?: string } | undefined;
-    const createdId = created?.id ?? newAgentId;
-    const createdLabel = created?.label ?? newAgentLabel ?? createdId;
-    const createdDesc = created?.description ?? newAgentDescription ?? "";
-    setNewAgentId("");
-    setNewAgentLabel("");
-    setNewAgentDescription("");
-    await loadCustomAgents();
-    await loadCapabilities(capabilityQuery, capabilityPage);
-    setCapabilityOpen(false);
-    setMessages((prev) => [
-      ...prev,
-      {
-        role: "assistant",
-        content:
-          `已创建自建 Agent: ${createdLabel} (${createdId})\n` +
-          (createdDesc ? `描述: ${createdDesc}\n` : "") +
-          "初始 Plan:\n" +
-          "1. 识别并澄清用户目标\n" +
-          "2. 生成可执行步骤与所需 skill\n" +
-          "3. 等待用户确认后执行\n\n" +
-          "请继续输入你的意图（例如：帮我规划今天上海出行）。",
-      },
-    ]);
-    setInput("");
   }
 
   async function deleteCustomAgent(agentId: string) {
-    const res = await fetch(`${apiBaseUrl}/v1/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setError(data?.detail ?? "delete agent failed");
-      return;
-    }
-    if (data?.status === "success") {
-      await loadCustomAgents();
-      await loadCapabilities(capabilityQuery, capabilityPage);
+    setCustomAgentDeletingId(agentId);
+    try {
+      const res = await fetch(`${apiBaseUrl}/v1/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.detail ?? "delete agent failed");
+        return;
+      }
+      if (data?.status === "success") {
+        await loadCustomAgents();
+        await loadCapabilities(capabilityQuery, capabilityPage);
+      }
+    } finally {
+      setCustomAgentDeletingId(null);
     }
   }
 
@@ -803,11 +1129,11 @@ export default function Home() {
             llmConfig:
               deepseekConfig.enabled && deepseekConfig.apiKey.trim()
                 ? {
-                    provider: "deepseek",
-                    apiKey: deepseekConfig.apiKey.trim(),
-                    baseUrl: deepseekConfig.baseUrl.trim(),
-                    model: deepseekConfig.model.trim(),
-                  }
+                  provider: "deepseek",
+                  apiKey: deepseekConfig.apiKey.trim(),
+                  baseUrl: deepseekConfig.baseUrl.trim(),
+                  model: deepseekConfig.model.trim(),
+                }
                 : null,
           },
         }),
@@ -838,14 +1164,14 @@ export default function Home() {
         typeof data?.output?.thinking === "string" ? data.output.thinking : "";
       const searchEvidence = Array.isArray(data?.output?.searchEvidence)
         ? data.output.searchEvidence
-            .map((x: unknown) => {
-              const item = x as { title?: string; url?: string };
-              return {
-                title: String(item?.title ?? "").trim(),
-                url: String(item?.url ?? "").trim(),
-              };
-            })
-            .filter((x: { title: string; url: string }) => x.title && x.url.startsWith("https://"))
+          .map((x: unknown) => {
+            const item = x as { title?: string; url?: string };
+            return {
+              title: String(item?.title ?? "").trim(),
+              url: String(item?.url ?? "").trim(),
+            };
+          })
+          .filter((x: { title: string; url: string }) => x.title && x.url.startsWith("https://"))
         : [];
       const clawhubSuggestions = normalizeClawhubSuggestions(data?.output?.clawhubPlanSuggestions);
       const executionPlan = normalizeExecutionPlan(data?.output?.executionPlan, lines, mode);
@@ -891,6 +1217,7 @@ export default function Home() {
         };
       });
       setStepExecutionConfigs(initialStepConfigs);
+      setStepToolInputs({});
       setPlanFolderAuths([]);
       setPlanFolderPathInput("");
       setPlanFolderPermInput("777");
@@ -1002,6 +1329,7 @@ export default function Home() {
       agent: stepExecutionConfigs[idx]?.agent || pendingPlan.mode,
       skills: stepExecutionConfigs[idx]?.skills || [],
       tools: stepExecutionConfigs[idx]?.tools || [],
+      toolInputs: stepToolInputs[idx] || {},
     }));
     const selectedClawhubSlugs = (pendingPlan.clawhubSuggestions ?? [])
       .filter((x) => x.userSelected)
@@ -1071,11 +1399,11 @@ export default function Home() {
             llmConfig:
               deepseekConfig.enabled && deepseekConfig.apiKey.trim()
                 ? {
-                    provider: "deepseek",
-                    apiKey: deepseekConfig.apiKey.trim(),
-                    baseUrl: deepseekConfig.baseUrl.trim(),
-                    model: deepseekConfig.model.trim(),
-                  }
+                  provider: "deepseek",
+                  apiKey: deepseekConfig.apiKey.trim(),
+                  baseUrl: deepseekConfig.baseUrl.trim(),
+                  model: deepseekConfig.model.trim(),
+                }
                 : null,
           },
         }),
@@ -1181,6 +1509,7 @@ export default function Home() {
         setSelectedPlanBranch({});
         setPlanBranchInput({});
         setStepExecutionConfigs({});
+        setStepToolInputs({});
         setExecutionStepStates({});
         setStepApprovals({});
         setActiveTraceId(null);
@@ -1264,11 +1593,11 @@ export default function Home() {
             llmConfig:
               deepseekConfig.enabled && deepseekConfig.apiKey.trim()
                 ? {
-                    provider: "deepseek",
-                    apiKey: deepseekConfig.apiKey.trim(),
-                    baseUrl: deepseekConfig.baseUrl.trim(),
-                    model: deepseekConfig.model.trim(),
-                  }
+                  provider: "deepseek",
+                  apiKey: deepseekConfig.apiKey.trim(),
+                  baseUrl: deepseekConfig.baseUrl.trim(),
+                  model: deepseekConfig.model.trim(),
+                }
                 : null,
           },
         }),
@@ -1377,6 +1706,7 @@ export default function Home() {
     setSelectedPlanBranch({});
     setPlanBranchInput({});
     setStepExecutionConfigs({});
+    setStepToolInputs({});
     setPlanFolderAuths([]);
     setPlanFolderPathInput("");
     setPlanFolderPermInput("777");
@@ -1424,15 +1754,15 @@ export default function Home() {
       executionMode: item.executionMode === "user_exec" ? "user_exec" : "auto_exec",
       taskChecklist: Array.isArray(item.taskChecklist)
         ? item.taskChecklist.map((x, idx) => ({
-            id: x.id || `history_${item.requestId}_${idx}`,
-            text: x.text,
-            done: Boolean(x.done),
-          }))
+          id: x.id || `history_${item.requestId}_${idx}`,
+          text: x.text,
+          done: Boolean(x.done),
+        }))
         : item.lines.map((line, idx) => ({
-            id: `history_${item.requestId}_${idx}`,
-            text: line,
-            done: false,
-          })),
+          id: `history_${item.requestId}_${idx}`,
+          text: line,
+          done: false,
+        })),
       clawhubSuggestions: normalizeClawhubSuggestions(item.clawhubSuggestions),
       executionPlan: normalizeExecutionPlan(item.executionPlan, item.lines, item.mode),
     });
@@ -1444,27 +1774,28 @@ export default function Home() {
     const initialStepConfigs: Record<number, StepExecutionConfig> =
       item.stepExecutionConfigs && Object.keys(item.stepExecutionConfigs).length > 0
         ? Object.fromEntries(
-            Object.entries(item.stepExecutionConfigs).map(([key, value]) => [
-              Number(key),
-              {
-                agent: value.agent,
-                skills: Array.isArray(value.skills) ? value.skills : [],
-                tools: Array.isArray(value.tools) ? value.tools : [],
-              },
-            ])
-          )
+          Object.entries(item.stepExecutionConfigs).map(([key, value]) => [
+            Number(key),
+            {
+              agent: value.agent,
+              skills: Array.isArray(value.skills) ? value.skills : [],
+              tools: Array.isArray(value.tools) ? value.tools : [],
+            },
+          ])
+        )
         : (() => {
-            const fallback: Record<number, StepExecutionConfig> = {};
-            item.lines.forEach((_, idx) => {
-              fallback[idx] = {
-                agent: item.mode,
-                skills: [...item.recommendedSkills],
-                tools: [],
-              };
-            });
-            return fallback;
-          })();
+          const fallback: Record<number, StepExecutionConfig> = {};
+          item.lines.forEach((_, idx) => {
+            fallback[idx] = {
+              agent: item.mode,
+              skills: [...item.recommendedSkills],
+              tools: [],
+            };
+          });
+          return fallback;
+        })();
     setStepExecutionConfigs(initialStepConfigs);
+    setStepToolInputs({});
     setStrategy(item.mode);
   }
 
@@ -1628,15 +1959,14 @@ export default function Home() {
       id: `n-${idx + 1}`,
       position: { x: 80 + idx * 280, y: 120 },
       data: {
-        label: `Step ${idx + 1}\n${line}\nagent: ${source.mode}\nskill: ${
-          source.skills.length > 0 ? source.skills.join(", ") : "none"
-        }`,
+        label: `Step ${idx + 1}\n${line}\nagent: ${source.mode}\nskill: ${source.skills.length > 0 ? source.skills.join(", ") : "none"
+          }`,
       },
       draggable: true,
       style: {
-        color: "#7a5a1f",
-        background: "#f3e2b3",
-        border: "1px solid #d6b36a",
+        color: "#18181b",
+        background: "#f4f4f5",
+        border: "1px solid #a1a1aa",
         borderRadius: "8px",
         fontSize: "12px",
         whiteSpace: "pre-wrap",
@@ -1663,9 +1993,9 @@ export default function Home() {
       },
       draggable: true,
       style: {
-        color: "#7a5a1f",
-        background: "#f8eed4",
-        border: "1px solid #d6b36a",
+        color: "#18181b",
+        background: "#fafafa",
+        border: "1px solid #a1a1aa",
         borderRadius: "8px",
         fontSize: "12px",
         whiteSpace: "pre-wrap",
@@ -2050,6 +2380,63 @@ export default function Home() {
         })
       );
     }
+    if (!enabled) {
+      setStepToolInputs((prev) => {
+        const current = prev[stepIndex] ?? {};
+        if (!(toolId in current)) return prev;
+        const nextCurrent = { ...current };
+        delete nextCurrent[toolId];
+        return { ...prev, [stepIndex]: nextCurrent };
+      });
+    }
+  }
+
+  function getToolMeta(toolId: string) {
+    return capabilityTools.find((tool) => tool.id === toolId);
+  }
+
+  function updateStepToolInput(stepIndex: number, toolId: string, key: string, value: string) {
+    setStepToolInputs((prev) => ({
+      ...prev,
+      [stepIndex]: {
+        ...(prev[stepIndex] ?? {}),
+        [toolId]: {
+          ...((prev[stepIndex] ?? {})[toolId] ?? {}),
+          [key]: value,
+        },
+      },
+    }));
+  }
+
+  const missingRequiredToolInputs = useMemo(() => {
+    const issues: Array<{ stepIndex: number; toolId: string; key: string; label: string }> = [];
+    Object.entries(stepExecutionConfigs).forEach(([rawIndex, config]) => {
+      const stepIndex = Number(rawIndex);
+      const tools = config?.tools ?? [];
+      tools.forEach((toolId) => {
+        const meta = getToolMeta(toolId);
+        const requiredInputs = meta?.requiredUserInputs ?? [];
+        requiredInputs.forEach((input) => {
+          if (!input.required) return;
+          const value = stepToolInputs[stepIndex]?.[toolId]?.[input.key] ?? "";
+          if (!String(value).trim()) {
+            issues.push({
+              stepIndex,
+              toolId,
+              key: input.key,
+              label: input.label || input.key,
+            });
+          }
+        });
+      });
+    });
+    return issues;
+  }, [capabilityTools, stepExecutionConfigs, stepToolInputs]);
+
+  const canExecutePendingPlan = !loading && missingRequiredToolInputs.length === 0;
+
+  function requiredInputsForTool(toolId: string) {
+    return getToolMeta(toolId)?.requiredUserInputs ?? [];
   }
 
   function addPlanFolderAuth() {
@@ -2116,43 +2503,85 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-black">
       <header className="p-5 border-b border-zinc-200 dark:border-zinc-800">
-        <div className="max-w-3xl mx-auto flex items-center gap-3">
+        <div className="max-w-3xl mx-auto flex justify-between items-center gap-3">
           <div className="font-semibold">Chat UI</div>
-          <div className="text-sm text-zinc-500">FastAPI + LangGraph</div>
-          <AppButton
-            type="button"
-            className="ml-auto"
-            onClick={async () => {
-              try {
-                await loadCapabilities("", 1);
-                await loadCustomAgents();
-                await loadPersonalSkillTree();
-                setCapabilityOpen(true);
-              } catch (e: unknown) {
-                setError(e instanceof Error ? e.message : String(e));
-              }
-            }}
-          >
-            Agent/Skill
-          </AppButton>
-          <AppButton type="button" onClick={newChat}>
-            New Chat
-          </AppButton>
-          <AppButton
-            type="button"
-            onClick={async () => {
-              setRagOpen(true);
-              await loadRagViewer();
-            }}
-          >
-            RAG
-          </AppButton>
-          <AppButton type="button" onClick={() => setSettingsOpen(true)}>
-            Settings
-          </AppButton>
-          <AppButton type="button" onClick={() => setDeepseekOpen(true)}>
-            DeepSeek
-          </AppButton>
+          {/* <div className="text-sm text-zinc-500">FastAPI + LangGraph</div> */}
+          <div className="flex items-center gap-2">
+            <AppButton
+              type="button"
+              className="ml-auto"
+              onClick={async () => {
+                try {
+                  await loadCapabilities("", 1);
+                  await loadCustomAgents();
+                  await loadPersonalSkillTree();
+                  setCapabilityOpen(true);
+                } catch (e: unknown) {
+                  setError(e instanceof Error ? e.message : String(e));
+                }
+              }}
+            >
+              Agent/Skill
+            </AppButton>
+            <AppButton type="button" onClick={newChat}>
+              New Chat
+            </AppButton>
+            <AppButton
+              type="button"
+              onClick={async () => {
+                if (capabilityAgents.length === 0) {
+                  try {
+                    await loadCapabilities("", 1);
+                  } catch (e: unknown) {
+                    setError(e instanceof Error ? e.message : String(e));
+                    return;
+                  }
+                }
+                if (customAgents.length === 0) {
+                  try {
+                    await loadCustomAgents();
+                  } catch (e: unknown) {
+                    setError(e instanceof Error ? e.message : String(e));
+                    return;
+                  }
+                }
+                openAgentPlayground();
+              }}
+            >
+              Agents
+            </AppButton>
+            <AppButton
+              type="button"
+              onClick={async () => {
+                if (capabilityTools.length === 0) {
+                  try {
+                    await loadCapabilities("", 1);
+                  } catch (e: unknown) {
+                    setError(e instanceof Error ? e.message : String(e));
+                    return;
+                  }
+                }
+                openToolPlayground();
+              }}
+            >
+              Tools
+            </AppButton>
+            <AppButton
+              type="button"
+              onClick={async () => {
+                setRagOpen(true);
+                await loadRagViewer();
+              }}
+            >
+              RAG
+            </AppButton>
+            <AppButton type="button" onClick={() => setSettingsOpen(true)}>
+              Settings
+            </AppButton>
+            <AppButton type="button" onClick={() => setDeepseekOpen(true)}>
+              DeepSeek
+            </AppButton>
+          </div>
         </div>
       </header>
 
@@ -2179,13 +2608,13 @@ export default function Home() {
                       onChange={(e) =>
                         executionChecklist.length > 0
                           ? setExecutionChecklist((prev) =>
-                              prev.map((x) => (x.id === item.id ? { ...x, done: e.target.checked } : x))
-                            )
+                            prev.map((x) => (x.id === item.id ? { ...x, done: e.target.checked } : x))
+                          )
                           : updatePendingTaskChecklist(
-                              (pendingPlan?.taskChecklist ?? []).map((x) =>
-                                x.id === item.id ? { ...x, done: e.target.checked } : x
-                              )
+                            (pendingPlan?.taskChecklist ?? []).map((x) =>
+                              x.id === item.id ? { ...x, done: e.target.checked } : x
                             )
+                          )
                       }
                     />
                     <span className={item.done ? "line-through text-zinc-400" : ""}>{item.text}</span>
@@ -2225,493 +2654,550 @@ export default function Home() {
         </aside>
 
         <section className="flex flex-col gap-4">
-        <ChatPanel
-          messages={messages}
-          loading={loading}
-          error={error}
-          input={input}
-          onInputChange={setInput}
-          onSend={sendMessage}
-          canStop={loading}
-          onStop={stopChatAction}
-          canResume={canResumeChatAction}
-          onResume={resumeChatAction}
-          resumeLabel={resumeChatActionLabel}
-          onOpenTrace={openTrace}
-        />
+          <ChatPanel
+            messages={messages}
+            loading={loading}
+            error={error}
+            input={input}
+            onInputChange={setInput}
+            onSend={sendMessage}
+            canStop={loading}
+            onStop={stopChatAction}
+            canResume={canResumeChatAction}
+            onResume={resumeChatAction}
+            resumeLabel={resumeChatActionLabel}
+            onOpenTrace={openTrace}
+          />
 
-        {pendingPlan ? (
-          <div className="p-3 border border-zinc-300 dark:border-zinc-700 rounded bg-amber-50/70 dark:bg-zinc-900">
-            {pendingPlan.reusedFromPlanRecord ? (
-              <>
-                <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">命中历史计划记录</div>
-                <div className="mt-3 border border-zinc-200 dark:border-zinc-700 rounded p-3 bg-white/70 dark:bg-zinc-800">
-                  <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{pendingPlan.query}</div>
-                  <div className="mt-1 text-xs text-zinc-500">mode: {pendingPlan.mode}</div>
-                  <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
-                    意图：{pendingPlan.intentDescription}
+          {pendingPlan ? (
+            <div className="rounded border border-zinc-300 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-900">
+              {pendingPlan.reusedFromPlanRecord ? (
+                <>
+                  <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">命中历史计划记录</div>
+                  <div className="mt-3 border border-zinc-200 dark:border-zinc-700 rounded p-3 bg-white/70 dark:bg-zinc-800">
+                    <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{pendingPlan.query}</div>
+                    <div className="mt-1 text-xs text-zinc-500">mode: {pendingPlan.mode}</div>
+                    <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+                      意图：{pendingPlan.intentDescription}
+                    </div>
+                    <div className="mt-2 space-y-1 text-xs text-zinc-700 dark:text-zinc-300">
+                      {pendingPlan.lines.map((line, idx) => (
+                        <div key={`reused-plan-${idx}`}>{idx + 1}. {line}</div>
+                      ))}
+                    </div>
+                    <div className="mt-2 text-[11px] text-zinc-500">
+                      skill: {pendingPlan.recommendedSkills.length > 0 ? pendingPlan.recommendedSkills.join(", ") : "none"}
+                    </div>
+                    {pendingPlan.planRecordPath ? (
+                      <div className="mt-1 text-[10px] font-mono text-zinc-500 break-all">{pendingPlan.planRecordPath}</div>
+                    ) : null}
                   </div>
-                  <div className="mt-2 space-y-1 text-xs text-zinc-700 dark:text-zinc-300">
-                    {pendingPlan.lines.map((line, idx) => (
-                      <div key={`reused-plan-${idx}`}>{idx + 1}. {line}</div>
-                    ))}
+                  <div className="mt-3 flex items-center gap-2">
+                    {missingRequiredToolInputs.length > 0 ? (
+                      <div className="text-xs text-zinc-600 dark:text-zinc-300">
+                        缺少工具输入：{missingRequiredToolInputs.map((item) => `Step ${item.stepIndex + 1} ${item.toolId}.${item.label}`).join("，")}
+                      </div>
+                    ) : null}
                   </div>
-                  <div className="mt-2 text-[11px] text-zinc-500">
-                    skill: {pendingPlan.recommendedSkills.length > 0 ? pendingPlan.recommendedSkills.join(", ") : "none"}
-                  </div>
-                  {pendingPlan.planRecordPath ? (
-                    <div className="mt-1 text-[10px] font-mono text-zinc-500 break-all">{pendingPlan.planRecordPath}</div>
-                  ) : null}
-                </div>
-                <div className="mt-3 flex items-center gap-2">
-                  {pendingPlan.executionMode === "user_exec" ? (
-                    <AppButton type="button" size="md" variant="info" onClick={continueChatWithChecklist}>
-                      按选中 checklist 继续对话
+                  <div className="mt-3 flex items-center gap-2">
+                    {pendingPlan.executionMode === "user_exec" ? (
+                      <AppButton type="button" size="md" variant="info" onClick={continueChatWithChecklist}>
+                        按选中 checklist 继续对话
+                      </AppButton>
+                    ) : (
+                      <AppButton type="button" size="md" variant="success" onClick={() => void confirmAndExecute()} disabled={!canExecutePendingPlan}>
+                        执行
+                      </AppButton>
+                    )}
+                    <AppButton type="button" size="md" onClick={cancelPlan} disabled={loading}>
+                      取消
                     </AppButton>
-                  ) : (
-                    <AppButton type="button" size="md" variant="success" onClick={() => void confirmAndExecute()} disabled={loading}>
-                      执行
+                    <AppButton
+                      type="button"
+                      onClick={() =>
+                        openTaskFlow(
+                          {
+                            title: `${pendingPlan.query} (查看)`,
+                            mode: pendingPlan.mode,
+                            lines: buildConfirmedPlanLines(pendingPlan.lines),
+                            skills: pendingPlan.recommendedSkills,
+                          },
+                          false
+                        )
+                      }
+                      size="md"
+                      variant="info"
+                    >
+                      查看 Flow
                     </AppButton>
-                  )}
-                  <AppButton type="button" size="md" onClick={cancelPlan} disabled={loading}>
-                    取消
-                  </AppButton>
-                  <AppButton
-                    type="button"
-                    onClick={() =>
-                      openTaskFlow(
-                        {
-                          title: `${pendingPlan.query} (查看)`,
-                          mode: pendingPlan.mode,
-                          lines: buildConfirmedPlanLines(pendingPlan.lines),
-                          skills: pendingPlan.recommendedSkills,
-                        },
-                        false
-                      )
-                    }
-                    size="md"
-                    variant="info"
-                  >
-                    查看 Flow
-                  </AppButton>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
-                  执行计划待确认（mode: {pendingPlan.mode}）
-                </div>
-                <div className="mt-2 flex items-center gap-2">
-                  <div className="text-xs text-zinc-500">执行模式</div>
-                  <select
-                    className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
-                    value={pendingPlan.executionMode}
-                    onChange={(e) =>
-                      setPendingPlan((prev) =>
-                        prev
-                          ? {
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                    执行计划待确认（mode: {pendingPlan.mode}）
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <div className="text-xs text-zinc-500">执行模式</div>
+                    <select
+                      className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                      value={pendingPlan.executionMode}
+                      onChange={(e) =>
+                        setPendingPlan((prev) =>
+                          prev
+                            ? {
                               ...prev,
                               executionMode: e.target.value === "user_exec" ? "user_exec" : "auto_exec",
                             }
-                          : prev
-                      )
-                    }
-                  >
-                    <option value="auto_exec">系统自动执行（exec + test）</option>
-                    <option value="user_exec">用户自行执行（仅输出 checklist）</option>
-                  </select>
-                </div>
-                <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-                  用户问题：{pendingPlan.query}
-                </div>
-                <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
-                  意图：{pendingPlan.intentDescription}
-                </div>
-            {pendingPlan.thinking ? (
-              <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap">
-                思考：{pendingPlan.thinking}
-              </div>
-            ) : null}
-            {pendingPlan.searchEvidence.length > 0 ? (
-              <div className="mt-2">
-                <div className="text-xs text-zinc-500 mb-1">检索依据</div>
-                <div className="space-y-1">
-                  {pendingPlan.searchEvidence.map((item, idx) => (
-                    <a
-                      key={`${item.url}-${idx}`}
-                      href={item.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="block text-xs text-indigo-700 hover:underline"
-                    >
-                      {idx + 1}. {item.title}
-                    </a>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            {!loading &&
-            pendingPlan.clawhubSuggestions &&
-            pendingPlan.clawhubSuggestions.length > 0 ? (
-              <div className="mt-3">
-                <div className="text-xs text-zinc-500 mb-2">
-                  ClawHub 相关技能（向量检索 + 启发式/LLM 简要分析；<strong>默认不勾选</strong>
-                  ，确认执行时仅对你勾选的 slug 注册并纳入技能流）
-                </div>
-                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-                  {pendingPlan.clawhubSuggestions.map((s) => (
-                    <div
-                      key={s.slug}
-                      className="border border-zinc-200 dark:border-zinc-700 rounded p-2 bg-white/60 dark:bg-zinc-800/80"
-                    >
-                      <label className="flex items-start gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          className="mt-1 shrink-0"
-                          checked={Boolean(s.userSelected)}
-                          onChange={(e) => toggleClawhubSuggestion(s.slug, e.target.checked)}
-                        />
-                        <div className="flex-1 min-w-0 space-y-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm font-medium text-zinc-800 dark:text-zinc-100">{s.name}</span>
-                            <span
-                              className={`text-[10px] px-1.5 py-0.5 rounded ${
-                                s.riskLevel === "high"
-                                  ? "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
-                                  : s.riskLevel === "medium"
-                                    ? "bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100"
-                                    : "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100"
-                              }`}
-                            >
-                              risk {s.riskLevel}
-                            </span>
-                            <span
-                              className={`text-[10px] px-1.5 py-0.5 rounded ${
-                                s.recommendation === "avoid"
-                                  ? "bg-red-50 text-red-700 dark:bg-red-950/50"
-                                  : s.recommendation === "review"
-                                    ? "bg-amber-50 text-amber-800 dark:bg-amber-950/50"
-                                    : "bg-emerald-50 text-emerald-800 dark:bg-emerald-950/50"
-                              }`}
-                            >
-                              {s.recommendation}
-                            </span>
-                          </div>
-                          <div className="text-[10px] font-mono text-zinc-500 break-all">{s.slug}</div>
-                          {s.summary ? (
-                            <div className="text-xs text-zinc-600 dark:text-zinc-400 line-clamp-2">{s.summary}</div>
-                          ) : null}
-                          <div className="text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">{s.analysis}</div>
-                          {typeof s.score === "number" ? (
-                            <div className="text-[10px] text-zinc-400">match score {s.score.toFixed(3)}</div>
-                          ) : null}
-                        </div>
-                      </label>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400">
-              推荐 skills:{" "}
-              {pendingPlan.recommendedSkills.length > 0
-                ? pendingPlan.recommendedSkills.join(", ")
-                : "无"}
-            </div>
-            <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-              缺失 skills: {pendingPlan.missingSkills.length > 0 ? pendingPlan.missingSkills.join(", ") : "无"}
-            </div>
-            <div className="mt-2">
-              <div className="text-xs text-zinc-500 mb-1">确认要使用的 skills</div>
-              <div className="flex flex-wrap gap-2">
-                {(pendingPlan.requiredSkills.length > 0
-                  ? pendingPlan.requiredSkills
-                  : pendingPlan.recommendedSkills
-                ).map((sid) => (
-                  <label
-                    key={sid}
-                    className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={confirmedSkills.includes(sid)}
-                      onChange={(e) =>
-                        setConfirmedSkills((prev) =>
-                          e.target.checked
-                            ? Array.from(new Set([...prev, sid]))
-                            : prev.filter((x) => x !== sid)
+                            : prev
                         )
                       }
-                    />
-                    {sid}
-                  </label>
-                ))}
-              </div>
-            </div>
-            {activeTraceId ? (
-              <div className="mt-2 text-xs font-mono text-indigo-700 dark:text-indigo-300">
-                traceId: {activeTraceId}
-              </div>
-            ) : null}
-            <div className="mt-3 space-y-2">
-              {pendingPlan.lines.length > 0 ? (
-                pendingPlan.lines.map((line, idx) => {
-                  const stepIdForRow = pendingPlan.executionPlan?.steps?.[idx]?.id ?? `s${idx + 1}`;
-                  const rowState = executionStepStates[stepIdForRow];
-                  return (
-                  <div
-                    key={`${idx}`}
-                    className="text-sm text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded px-3 py-2 bg-white/70 dark:bg-zinc-800"
-                  >
-                    <div className="flex items-start gap-2">
-                      <span className="mt-2 text-xs text-zinc-500">{idx + 1}.</span>
-                      {rowState ? (
-                        <span
-                          className={`mt-1.5 text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
-                            rowState === "running"
-                              ? "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200"
-                              : rowState === "success"
-                                ? "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100"
-                                : rowState === "failed"
-                                  ? "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
-                                  : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                          }`}
-                        >
-                          {stepIdForRow}:{rowState}
-                        </span>
-                      ) : null}
-                      <input
-                        className="flex-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 bg-white dark:bg-zinc-900"
-                        value={line}
-                        onChange={(e) => updatePlanLine(idx, e.target.value)}
-                      />
+                    >
+                      <option value="auto_exec">系统自动执行（exec + test）</option>
+                      <option value="user_exec">用户自行执行（仅输出 checklist）</option>
+                    </select>
+                  </div>
+                  <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                    用户问题：{pendingPlan.query}
+                  </div>
+                  <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+                    意图：{pendingPlan.intentDescription}
+                  </div>
+                  {pendingPlan.thinking ? (
+                    <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap">
+                      思考：{pendingPlan.thinking}
                     </div>
-                    <div className="mt-2 ml-6">
-                      <div className="mb-2 grid grid-cols-1 md:grid-cols-[200px_1fr] gap-2">
-                        <label className="text-xs text-zinc-500">
-                          agent
-                          <select
-                            className="mt-1 w-full border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
-                            value={stepExecutionConfigs[idx]?.agent ?? pendingPlan.mode}
-                            onChange={(e) => updateStepAgent(idx, e.target.value)}
+                  ) : null}
+                  {pendingPlan.searchEvidence.length > 0 ? (
+                    <div className="mt-2">
+                      <div className="text-xs text-zinc-500 mb-1">检索依据</div>
+                      <div className="space-y-1">
+                        {pendingPlan.searchEvidence.map((item, idx) => (
+                          <a
+                            key={`${item.url}-${idx}`}
+                            href={item.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="block text-xs text-zinc-700 hover:underline dark:text-zinc-300"
                           >
-                            {capabilityAgents.length > 0 ? (
-                              capabilityAgents.map((a) => (
-                                <option key={a.id} value={a.id}>
-                                  {a.label}
-                                </option>
-                              ))
-                            ) : (
-                              <option value={pendingPlan.mode}>{pendingPlan.mode}</option>
-                            )}
-                          </select>
-                        </label>
-                        <div>
-                          <div className="text-xs text-zinc-500 mb-1">skills（whitelist）</div>
-                          <div className="flex flex-wrap gap-2">
-                            {(whitelistedSkills.length > 0 ? whitelistedSkills : pendingPlan.requiredSkills).map((sid) => (
-                              <label
-                                key={`${idx}-${sid}`}
-                                className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
-                              >
-                                <input
-                                  type="checkbox"
-                                  checked={Boolean(stepExecutionConfigs[idx]?.skills?.includes(sid))}
-                                  onChange={(e) => toggleStepSkill(idx, sid, e.target.checked)}
-                                />
-                                {sid}
-                              </label>
-                            ))}
-                            {whitelistedSkills.length === 0 && pendingPlan.requiredSkills.length === 0 ? (
-                              <div className="text-xs text-zinc-400">暂无 whitelist skill</div>
-                            ) : null}
-                          </div>
-                        </div>
+                            {idx + 1}. {item.title}
+                          </a>
+                        ))}
                       </div>
-                      <div className="mb-2">
-                        <div className="text-xs text-zinc-500 mb-1">tools</div>
-                        <div className="flex flex-wrap gap-2">
-                          {allowlistedTools.map((tid) => (
-                            <label
-                              key={`${idx}-tool-${tid}`}
-                              className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
-                            >
+                    </div>
+                  ) : null}
+                  {!loading &&
+                    pendingPlan.clawhubSuggestions &&
+                    pendingPlan.clawhubSuggestions.length > 0 ? (
+                    <div className="mt-3">
+                      <div className="text-xs text-zinc-500 mb-2">
+                        ClawHub 相关技能（向量检索 + 启发式/LLM 简要分析；<strong>默认不勾选</strong>
+                        ，确认执行时仅对你勾选的 slug 注册并纳入技能流）
+                      </div>
+                      <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                        {pendingPlan.clawhubSuggestions.map((s) => (
+                          <div
+                            key={s.slug}
+                            className="border border-zinc-200 dark:border-zinc-700 rounded p-2 bg-white/60 dark:bg-zinc-800/80"
+                          >
+                            <label className="flex items-start gap-2 cursor-pointer">
                               <input
                                 type="checkbox"
-                                checked={Boolean(stepExecutionConfigs[idx]?.tools?.includes(tid))}
-                                onChange={(e) => toggleStepTool(idx, tid, e.target.checked)}
+                                className="mt-1 shrink-0"
+                                checked={Boolean(s.userSelected)}
+                                onChange={(e) => toggleClawhubSuggestion(s.slug, e.target.checked)}
                               />
-                              {tid}
+                              <div className="flex-1 min-w-0 space-y-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-sm font-medium text-zinc-800 dark:text-zinc-100">{s.name}</span>
+                                  <span
+                                    className={`text-[10px] px-1.5 py-0.5 rounded ${s.riskLevel === "high"
+                                      ? "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
+                                      : s.riskLevel === "medium"
+                                        ? "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100"
+                                        : "bg-zinc-100 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-100"
+                                      }`}
+                                  >
+                                    risk {s.riskLevel}
+                                  </span>
+                                  <span
+                                    className={`text-[10px] px-1.5 py-0.5 rounded ${s.recommendation === "avoid"
+                                      ? "bg-red-50 text-red-700 dark:bg-red-950/50"
+                                      : s.recommendation === "review"
+                                        ? "bg-zinc-100 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-100"
+                                        : "bg-zinc-50 text-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                                      }`}
+                                  >
+                                    {s.recommendation}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] font-mono text-zinc-500 break-all">{s.slug}</div>
+                                {s.summary ? (
+                                  <div className="text-xs text-zinc-600 dark:text-zinc-400 line-clamp-2">{s.summary}</div>
+                                ) : null}
+                                <div className="text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">{s.analysis}</div>
+                                {typeof s.score === "number" ? (
+                                  <div className="text-[10px] text-zinc-400">match score {s.score.toFixed(3)}</div>
+                                ) : null}
+                              </div>
                             </label>
-                          ))}
-                          {allowlistedTools.length === 0 ? (
-                            <div className="text-xs text-zinc-400">暂无可用 tool</div>
-                          ) : null}
-                        </div>
+                          </div>
+                        ))}
                       </div>
-                      <div className="text-xs text-zinc-500 mb-1">后续分支</div>
-                      {renderBranchEditor(idx, null, 0)}
+                    </div>
+                  ) : null}
+                  <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400">
+                    推荐 skills:{" "}
+                    {pendingPlan.recommendedSkills.length > 0
+                      ? pendingPlan.recommendedSkills.join(", ")
+                      : "无"}
+                  </div>
+                  <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                    缺失 skills: {pendingPlan.missingSkills.length > 0 ? pendingPlan.missingSkills.join(", ") : "无"}
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-xs text-zinc-500 mb-1">确认要使用的 skills</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(pendingPlan.requiredSkills.length > 0
+                        ? pendingPlan.requiredSkills
+                        : pendingPlan.recommendedSkills
+                      ).map((sid) => (
+                        <label
+                          key={sid}
+                          className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={confirmedSkills.includes(sid)}
+                            onChange={(e) =>
+                              setConfirmedSkills((prev) =>
+                                e.target.checked
+                                  ? Array.from(new Set([...prev, sid]))
+                                  : prev.filter((x) => x !== sid)
+                              )
+                            }
+                          />
+                          {sid}
+                        </label>
+                      ))}
                     </div>
                   </div>
-                );
-                })
-              ) : (
-                <div className="text-sm text-zinc-500">未返回可展示的计划步骤。</div>
-              )}
-            </div>
-            {!loading &&
-            pendingPlan.lines.length > 0 &&
-            pendingPlan.lines.every((x) => x.trim().length > 0) &&
-            pendingPlan.taskChecklist.length > 0 ? (
-              <div className="mt-3">
-                <div className="text-xs text-zinc-500 mb-1">计划任务 Checklist（可勾选保存）</div>
-                <div className="space-y-1">
-                  {pendingPlan.taskChecklist.map((item) => (
-                    <label
-                      key={item.id}
-                      className="text-xs flex items-start gap-2 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
-                    >
+                  {activeTraceId ? (
+                    <div className="mt-2 text-xs font-mono text-zinc-700 dark:text-zinc-300">
+                      traceId: {activeTraceId}
+                    </div>
+                  ) : null}
+                  <div className="mt-3 space-y-2">
+                    {pendingPlan.lines.length > 0 ? (
+                      pendingPlan.lines.map((line, idx) => {
+                        const stepIdForRow = pendingPlan.executionPlan?.steps?.[idx]?.id ?? `s${idx + 1}`;
+                        const rowState = executionStepStates[stepIdForRow];
+                        return (
+                          <div
+                            key={`${idx}`}
+                            className="text-sm text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded px-3 py-2 bg-white/70 dark:bg-zinc-800"
+                          >
+                            <div className="flex items-start gap-2">
+                              <span className="mt-2 text-xs text-zinc-500">{idx + 1}.</span>
+                              {rowState ? (
+                                <span
+                                  className={`mt-1.5 text-[10px] px-1.5 py-0.5 rounded shrink-0 ${rowState === "running"
+                                    ? "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200"
+                                    : rowState === "success"
+                                      ? "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100"
+                                      : rowState === "failed"
+                                        ? "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
+                                        : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                                    }`}
+                                >
+                                  {stepIdForRow}:{rowState}
+                                </span>
+                              ) : null}
+                              <input
+                                className="flex-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 bg-white dark:bg-zinc-900"
+                                value={line}
+                                onChange={(e) => updatePlanLine(idx, e.target.value)}
+                              />
+                            </div>
+                            <div className="mt-2 ml-6">
+                              <div className="mb-2 grid grid-cols-1 md:grid-cols-[200px_1fr] gap-2">
+                                <label className="text-xs text-zinc-500">
+                                  agent
+                                  <select
+                                    className="mt-1 w-full border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                                    value={stepExecutionConfigs[idx]?.agent ?? pendingPlan.mode}
+                                    onChange={(e) => updateStepAgent(idx, e.target.value)}
+                                  >
+                                    {capabilityAgents.length > 0 ? (
+                                      capabilityAgents.map((a) => (
+                                        <option key={a.id} value={a.id}>
+                                          {a.label}
+                                        </option>
+                                      ))
+                                    ) : (
+                                      <option value={pendingPlan.mode}>{pendingPlan.mode}</option>
+                                    )}
+                                  </select>
+                                </label>
+                                <div>
+                                  <div className="text-xs text-zinc-500 mb-1">skills（whitelist）</div>
+                                  <div className="flex flex-wrap gap-2">
+                                    {(whitelistedSkills.length > 0 ? whitelistedSkills : pendingPlan.requiredSkills).map((sid) => (
+                                      <label
+                                        key={`${idx}-${sid}`}
+                                        className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={Boolean(stepExecutionConfigs[idx]?.skills?.includes(sid))}
+                                          onChange={(e) => toggleStepSkill(idx, sid, e.target.checked)}
+                                        />
+                                        {sid}
+                                      </label>
+                                    ))}
+                                    {whitelistedSkills.length === 0 && pendingPlan.requiredSkills.length === 0 ? (
+                                      <div className="text-xs text-zinc-400">暂无 whitelist skill</div>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="mb-2">
+                                <div className="text-xs text-zinc-500 mb-1">tools</div>
+                                <div className="flex flex-wrap gap-2">
+                                  {allowlistedTools.map((tid) => (
+                                    <label
+                                      key={`${idx}-tool-${tid}`}
+                                      className="text-xs flex items-center gap-1 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={Boolean(stepExecutionConfigs[idx]?.tools?.includes(tid))}
+                                        onChange={(e) => toggleStepTool(idx, tid, e.target.checked)}
+                                      />
+                                      {tid}
+                                    </label>
+                                  ))}
+                                  {allowlistedTools.length === 0 ? (
+                                    <div className="text-xs text-zinc-400">暂无可用 tool</div>
+                                  ) : null}
+                                </div>
+                                {(stepExecutionConfigs[idx]?.tools ?? []).length > 0 ? (
+                                  <div className="mt-2 space-y-2">
+                                    {(stepExecutionConfigs[idx]?.tools ?? []).map((toolId) => {
+                                      const requiredInputs = requiredInputsForTool(toolId);
+                                      if (!requiredInputs.length) return null;
+                                      return (
+                                        <div
+                                          key={`${idx}-tool-inputs-${toolId}`}
+                                          className="rounded border border-zinc-200 dark:border-zinc-700 px-2 py-2 bg-zinc-50/60 dark:bg-zinc-900/40"
+                                        >
+                                          <div className="text-[11px] font-medium text-zinc-600 dark:text-zinc-300 mb-2">
+                                            {toolId} required inputs
+                                          </div>
+                                          <div className="space-y-2">
+                                            {requiredInputs.map((inputMeta) => {
+                                              const value = stepToolInputs[idx]?.[toolId]?.[inputMeta.key] ?? "";
+                                              const inputType = inputMeta.secret || inputMeta.type === "password" ? "password" : "text";
+                                              return (
+                                                <label key={`${toolId}-${inputMeta.key}`} className="block">
+                                                  <div className="text-[11px] text-zinc-500 mb-1">
+                                                    {inputMeta.label || inputMeta.key}
+                                                    {inputMeta.required ? " *" : ""}
+                                                  </div>
+                                                  {inputMeta.type === "textarea" ? (
+                                                    <textarea
+                                                      className="w-full min-h-20 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                                                      value={value}
+                                                      placeholder={inputMeta.placeholder ?? ""}
+                                                      onChange={(e) => updateStepToolInput(idx, toolId, inputMeta.key, e.target.value)}
+                                                    />
+                                                  ) : (
+                                                    <input
+                                                      type={inputType}
+                                                      className="w-full border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs bg-white dark:bg-zinc-900"
+                                                      value={value}
+                                                      placeholder={inputMeta.placeholder ?? ""}
+                                                      onChange={(e) => updateStepToolInput(idx, toolId, inputMeta.key, e.target.value)}
+                                                    />
+                                                  )}
+                                                </label>
+                                              );
+                                            })}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                ) : null}
+                              </div>
+                              <div className="text-xs text-zinc-500 mb-1">后续分支</div>
+                              {renderBranchEditor(idx, null, 0)}
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="text-sm text-zinc-500">未返回可展示的计划步骤。</div>
+                    )}
+                  </div>
+                  {!loading &&
+                    pendingPlan.lines.length > 0 &&
+                    pendingPlan.lines.every((x) => x.trim().length > 0) &&
+                    pendingPlan.taskChecklist.length > 0 ? (
+                    <div className="mt-3">
+                      <div className="text-xs text-zinc-500 mb-1">计划任务 Checklist（可勾选保存）</div>
+                      <div className="space-y-1">
+                        {pendingPlan.taskChecklist.map((item) => (
+                          <label
+                            key={item.id}
+                            className="text-xs flex items-start gap-2 border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={item.done}
+                              onChange={(e) =>
+                                updatePendingTaskChecklist(
+                                  pendingPlan.taskChecklist.map((x) =>
+                                    x.id === item.id ? { ...x, done: e.target.checked } : x
+                                  )
+                                )
+                              }
+                            />
+                            <span className={item.done ? "line-through text-zinc-400" : ""}>{item.text}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <label className="mt-3 block">
+                    <div className="text-xs text-zinc-500 mb-1">补充说明（可选）</div>
+                    <textarea
+                      className="w-full min-h-20 border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900 text-sm"
+                      placeholder="例如：优先给出上海浦东今天白天逐小时天气，并附出行建议。"
+                      value={planSupplement}
+                      onChange={(e) => updatePlanSupplement(e.target.value)}
+                    />
+                  </label>
+                  <div className="mt-3">
+                    <div className="text-xs text-zinc-500 mb-1">本地文件夹授权（路径 + Linux 权限）</div>
+                    <div className="flex items-center gap-2 flex-wrap">
                       <input
-                        type="checkbox"
-                        checked={item.done}
-                        onChange={(e) =>
-                          updatePendingTaskChecklist(
-                            pendingPlan.taskChecklist.map((x) =>
-                              x.id === item.id ? { ...x, done: e.target.checked } : x
-                            )
-                          )
-                        }
+                        className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-[320px] bg-white dark:bg-zinc-900"
+                        placeholder="/home/user/project"
+                        value={planFolderPathInput}
+                        onChange={(e) => setPlanFolderPathInput(e.target.value)}
                       />
-                      <span className={item.done ? "line-through text-zinc-400" : ""}>{item.text}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            <label className="mt-3 block">
-              <div className="text-xs text-zinc-500 mb-1">补充说明（可选）</div>
-              <textarea
-                className="w-full min-h-20 border border-zinc-300 dark:border-zinc-700 rounded px-3 py-2 bg-white dark:bg-zinc-900 text-sm"
-                placeholder="例如：优先给出上海浦东今天白天逐小时天气，并附出行建议。"
-                value={planSupplement}
-                onChange={(e) => updatePlanSupplement(e.target.value)}
-              />
-            </label>
-            <div className="mt-3">
-              <div className="text-xs text-zinc-500 mb-1">本地文件夹授权（路径 + Linux 权限）</div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <input
-                  className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-[320px] bg-white dark:bg-zinc-900"
-                  placeholder="/home/user/project"
-                  value={planFolderPathInput}
-                  onChange={(e) => setPlanFolderPathInput(e.target.value)}
-                />
-                <input
-                  className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-20 text-center bg-white dark:bg-zinc-900"
-                  placeholder="777"
-                  value={planFolderPermInput}
-                  onChange={(e) => setPlanFolderPermInput(e.target.value)}
-                />
-                <AppButton type="button" size="xs" onClick={() => void pickPlanFolderPath()}>
-                  选择文件夹
-                </AppButton>
-                <AppButton type="button" size="xs" variant="info" onClick={addPlanFolderAuth}>
-                  添加授权
-                </AppButton>
-              </div>
-              <div className="mt-2 flex items-center gap-2 flex-wrap">
-                {planFolderAuths.length === 0 ? (
-                  <div className="text-xs text-zinc-400">none</div>
-                ) : (
-                  planFolderAuths.map((item) => (
-                    <div
-                      key={`${item.path}-${item.permission}`}
-                      className="text-xs border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 flex items-center gap-1"
-                    >
-                      <span>{item.path}</span>
-                      <span className="text-zinc-500">({item.permission})</span>
-                      <AppButton type="button" size="xs" variant="danger" onClick={() => removePlanFolderAuth(item.path)}>
-                        x
+                      <input
+                        className="border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 text-xs w-20 text-center bg-white dark:bg-zinc-900"
+                        placeholder="777"
+                        value={planFolderPermInput}
+                        onChange={(e) => setPlanFolderPermInput(e.target.value)}
+                      />
+                      <AppButton type="button" size="xs" onClick={() => void pickPlanFolderPath()}>
+                        选择文件夹
+                      </AppButton>
+                      <AppButton type="button" size="xs" variant="info" onClick={addPlanFolderAuth}>
+                        添加授权
                       </AppButton>
                     </div>
-                  ))
-                )}
-              </div>
-            </div>
-            {pendingPlan.installRequired ? (
-              <label className="mt-2 flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
-                <input
-                  type="checkbox"
-                  checked={autoInstallMissing}
-                  onChange={(e) => setAutoInstallMissing(e.target.checked)}
-                />
-                确认后自动安装缺失 skills（仅白名单）
-              </label>
-            ) : null}
-            <div className="mt-3 flex items-center gap-2">
-              {pendingApprovalStepId ? (
-                <>
-                  <AppButton
-                    type="button"
-                    size="md"
-                    variant="info"
-                    onClick={() => {
-                      setStepApprovals((prev) => ({ ...prev, [pendingApprovalStepId]: true }));
-                      void confirmAndExecute();
-                    }}
-                    disabled={loading}
-                  >
-                    同意 {pendingApprovalStepId} 并继续执行
-                  </AppButton>
-                  <AppButton
-                    type="button"
-                    size="md"
-                    variant="danger"
-                    onClick={() => {
-                      setPendingApprovalStepId(null);
-                      setMessages((prev) => [...prev, { role: "assistant", content: `已拒绝步骤 ${pendingApprovalStepId}，执行终止。` }]);
-                    }}
-                    disabled={loading}
-                  >
-                    拒绝并终止
-                  </AppButton>
+                    <div className="mt-2 flex items-center gap-2 flex-wrap">
+                      {planFolderAuths.length === 0 ? (
+                        <div className="text-xs text-zinc-400">none</div>
+                      ) : (
+                        planFolderAuths.map((item) => (
+                          <div
+                            key={`${item.path}-${item.permission}`}
+                            className="text-xs border border-zinc-300 dark:border-zinc-700 rounded px-2 py-1 flex items-center gap-1"
+                          >
+                            <span>{item.path}</span>
+                            <span className="text-zinc-500">({item.permission})</span>
+                            <AppButton type="button" size="xs" variant="danger" onClick={() => removePlanFolderAuth(item.path)}>
+                              x
+                            </AppButton>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                  {pendingPlan.installRequired ? (
+                    <label className="mt-2 flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={autoInstallMissing}
+                        onChange={(e) => setAutoInstallMissing(e.target.checked)}
+                      />
+                      确认后自动安装缺失 skills（仅白名单）
+                    </label>
+                  ) : null}
+                  {missingRequiredToolInputs.length > 0 ? (
+                    <div className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                      缺少工具输入：{missingRequiredToolInputs.map((item) => `Step ${item.stepIndex + 1} ${item.toolId}.${item.label}`).join("，")}
+                    </div>
+                  ) : null}
+                  <div className="mt-3 flex items-center gap-2">
+                    {pendingApprovalStepId ? (
+                      <>
+                        <AppButton
+                          type="button"
+                          size="md"
+                          variant="info"
+                          onClick={() => {
+                            setStepApprovals((prev) => ({ ...prev, [pendingApprovalStepId]: true }));
+                            void confirmAndExecute();
+                          }}
+                          disabled={loading}
+                        >
+                          同意 {pendingApprovalStepId} 并继续执行
+                        </AppButton>
+                        <AppButton
+                          type="button"
+                          size="md"
+                          variant="danger"
+                          onClick={() => {
+                            setPendingApprovalStepId(null);
+                            setMessages((prev) => [...prev, { role: "assistant", content: `已拒绝步骤 ${pendingApprovalStepId}，执行终止。` }]);
+                          }}
+                          disabled={loading}
+                        >
+                          拒绝并终止
+                        </AppButton>
+                      </>
+                    ) : null}
+                    {pendingPlan.executionMode === "user_exec" ? (
+                      <AppButton type="button" size="md" variant="info" onClick={continueChatWithChecklist}>
+                        按选中 checklist 继续对话
+                      </AppButton>
+                    ) : (
+                      <AppButton type="button" size="md" variant="success" onClick={() => void confirmAndExecute()} disabled={!canExecutePendingPlan}>
+                        确认执行
+                      </AppButton>
+                    )}
+                    <AppButton type="button" size="md" onClick={cancelPlan} disabled={loading}>
+                      取消
+                    </AppButton>
+                    <AppButton
+                      type="button"
+                      onClick={() =>
+                        openTaskFlow(
+                          {
+                            title: `${pendingPlan.query} (可编辑)`,
+                            mode: pendingPlan.mode,
+                            lines: buildConfirmedPlanLines(pendingPlan.lines),
+                            skills: pendingPlan.recommendedSkills,
+                          },
+                          true
+                        )
+                      }
+                      size="md"
+                      variant="info"
+                    >
+                      Task Flow
+                    </AppButton>
+                  </div>
                 </>
-              ) : null}
-              {pendingPlan.executionMode === "user_exec" ? (
-                <AppButton type="button" size="md" variant="info" onClick={continueChatWithChecklist}>
-                  按选中 checklist 继续对话
-                </AppButton>
-              ) : (
-                <AppButton type="button" size="md" variant="success" onClick={() => void confirmAndExecute()} disabled={loading}>
-                  确认执行
-                </AppButton>
               )}
-              <AppButton type="button" size="md" onClick={cancelPlan} disabled={loading}>
-                取消
-              </AppButton>
-              <AppButton
-                type="button"
-                onClick={() =>
-                  openTaskFlow(
-                    {
-                      title: `${pendingPlan.query} (可编辑)`,
-                      mode: pendingPlan.mode,
-                      lines: buildConfirmedPlanLines(pendingPlan.lines),
-                      skills: pendingPlan.recommendedSkills,
-                    },
-                    true
-                  )
-                }
-                size="md"
-                variant="info"
-              >
-                Task Flow
-              </AppButton>
             </div>
-              </>
-            )}
-          </div>
-        ) : null}
+          ) : null}
 
         </section>
       </main>
@@ -2760,30 +3246,35 @@ export default function Home() {
         capabilityAgents={capabilityAgents}
         capabilitySkills={capabilitySkills}
         capabilityTools={capabilityTools}
+        capabilityLoading={capabilityLoading}
+        capabilityInstallingSkillId={capabilityInstallingSkillId}
+        capabilityTogglingWhitelistSkillId={capabilityTogglingWhitelistSkillId}
+        capabilityTogglingToolPolicyKey={capabilityTogglingToolPolicyKey}
         installSkill={installSkill}
         toggleWhitelist={toggleWhitelist}
         toggleToolPolicy={toggleToolPolicy}
+        openAgentPlayground={(agentId) => openAgentPlayground(agentId)}
+        openToolPlayground={(toolId) => openToolPlayground(toolId)}
         capabilityPage={capabilityPage}
         capabilitySkillsTotal={capabilitySkillsTotal}
         capabilityPageSize={capabilityPageSize}
         onlineQuery={onlineQuery}
         setOnlineQuery={setOnlineQuery}
+        onlineSkillsLoading={onlineSkillsLoading}
         searchOnlineSkills={searchOnlineSkills}
         onlineSkills={onlineSkills}
+        onlineAddingSkillId={onlineAddingSkillId}
         addOnlineSkill={addOnlineSkill}
-        newAgentId={newAgentId}
-        setNewAgentId={setNewAgentId}
-        newAgentLabel={newAgentLabel}
-        setNewAgentLabel={setNewAgentLabel}
-        newAgentDescription={newAgentDescription}
-        setNewAgentDescription={setNewAgentDescription}
+        customAgentCreating={customAgentCreating}
         createCustomAgent={createCustomAgent}
         customAgents={customAgents}
+        customAgentDeletingId={customAgentDeletingId}
         deleteCustomAgent={deleteCustomAgent}
         personalSkillRootPath={personalSkillRootPath}
         personalSkillPathInput={personalSkillPathInput}
-        setPersonalSkillPathInput={setPersonalSkillPathInput}
+        personalSkillPathSaving={personalSkillPathSaving}
         savePersonalSkillPath={savePersonalSkillPath}
+        personalSkillTreeLoading={personalSkillTreeLoading}
         loadPersonalSkillTree={loadPersonalSkillTree}
         pickPersonalSkillPath={pickPersonalSkillPath}
         personalSkillItems={personalSkillItems}
@@ -2822,7 +3313,12 @@ export default function Home() {
         onRefresh={async () => {
           await loadRagViewer();
         }}
+        onCreateScope={createRagScope}
         onAddDocument={addRagDocument}
+        onUpdateDocument={updateRagDocument}
+        onDeleteDocument={deleteRagDocument}
+        onBatchIngest={batchIngestRag}
+        onUploadFiles={uploadRagFiles}
       />
       <PlanRecordModal
         open={planRecordOpen}
@@ -2852,6 +3348,38 @@ export default function Home() {
         onSelectTrace={loadTrace}
         run={traceViewerRun}
         error={traceError}
+      />
+      <ToolPlaygroundModal
+        open={toolPlaygroundOpen}
+        onClose={() => setToolPlaygroundOpen(false)}
+        tenantId={tenantId}
+        ragScopes={ragScopes}
+        onOpenRagViewer={() => {
+          void loadRagViewer(ragSelectedScope);
+          setRagOpen(true);
+        }}
+        tools={capabilityTools}
+        selectedToolId={toolPlaygroundToolId}
+        onSelectTool={setToolPlaygroundToolId}
+        argsText={toolPlaygroundArgsText}
+        setArgsText={setToolPlaygroundArgsText}
+        loading={toolPlaygroundLoading}
+        response={toolPlaygroundResponse}
+        error={toolPlaygroundError}
+        onInvoke={invokeToolPlayground}
+      />
+      <AgentPlaygroundModal
+        open={agentPlaygroundOpen}
+        onClose={() => setAgentPlaygroundOpen(false)}
+        agents={dedupeAgentsById([...capabilityAgents, ...customAgents])}
+        selectedAgentId={agentPlaygroundAgentId}
+        onSelectAgent={setAgentPlaygroundAgentId}
+        prompt={agentPlaygroundPrompt}
+        setPrompt={setAgentPlaygroundPrompt}
+        loading={agentPlaygroundLoading}
+        response={agentPlaygroundResponse}
+        error={agentPlaygroundError}
+        onInvoke={invokeAgentPlayground}
       />
     </div>
   );

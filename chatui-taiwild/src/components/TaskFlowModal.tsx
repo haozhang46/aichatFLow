@@ -28,7 +28,7 @@ type SkillNodeData = {
 function SkillNode({ data }: NodeProps<Node<SkillNodeData>>) {
   const [value, setValue] = useState("");
   return (
-    <div className="min-w-[220px] border border-amber-400 bg-amber-100 rounded p-2 text-xs text-amber-900">
+    <div className="min-w-[220px] rounded border border-zinc-400 bg-zinc-100 p-2 text-xs text-zinc-900 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100">
       <div className="font-medium mb-1">Skills Node</div>
       <div className="space-y-1 mb-2">
         {data.skills.length > 0 ? (
@@ -43,13 +43,13 @@ function SkillNode({ data }: NodeProps<Node<SkillNodeData>>) {
             </div>
           ))
         ) : (
-          <div className="text-amber-700/70">none</div>
+          <div className="text-zinc-500">none</div>
         )}
       </div>
       {data.editable ? (
         <div className="flex items-center gap-1">
           <input
-            className="flex-1 border border-amber-500 rounded px-1 py-0.5 bg-amber-50"
+            className="flex-1 rounded border border-zinc-400 bg-white px-1 py-0.5 text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
             placeholder="add skill"
             value={value}
             onChange={(e) => setValue(e.target.value)}
@@ -57,7 +57,7 @@ function SkillNode({ data }: NodeProps<Node<SkillNodeData>>) {
           <AppButton
             type="button"
             size="xs"
-            className="border-amber-600"
+            className="border-zinc-500"
             onClick={() => {
               const next = value.trim();
               if (!next) return;
@@ -204,11 +204,11 @@ export default function TaskFlowModal(props: Props) {
           >
             <MiniMap
               pannable
-              nodeColor={() => "#d6b36a"}
-              maskColor="rgba(160, 120, 40, 0.18)"
-              style={{ backgroundColor: "#f8eed4", border: "1px solid #d6b36a" }}
+              nodeColor={() => "#71717a"}
+              maskColor="rgba(113, 113, 122, 0.16)"
+              style={{ backgroundColor: "#f4f4f5", border: "1px solid #a1a1aa" }}
             />
-            <Controls style={{ backgroundColor: "#f8eed4", border: "1px solid #d6b36a" }} />
+            <Controls style={{ backgroundColor: "#f4f4f5", border: "1px solid #a1a1aa" }} />
             <Background />
           </ReactFlow>
         </div>

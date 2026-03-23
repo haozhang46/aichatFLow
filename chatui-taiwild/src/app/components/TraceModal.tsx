@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import AppButton from "@/components/ui/AppButton";
 import AppModal from "@/components/ui/AppModal";
@@ -42,15 +42,10 @@ function pretty(value: unknown) {
   }
 }
 
-export default function TraceModal(props: Props) {
+function TraceModalBody(props: Props) {
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"all" | "step" | "from-step">("all");
   const [fullscreen, setFullscreen] = useState(false);
-
-  useEffect(() => {
-    setSelectedStepId(null);
-    setViewMode("all");
-  }, [props.traceId]);
 
   const filteredEvents = useMemo(() => {
     const events = props.run?.events ?? [];
@@ -67,6 +62,14 @@ export default function TraceModal(props: Props) {
     );
     return startIndex >= 0 ? events.slice(startIndex) : events.filter((event) => String(event.stepId ?? "") === selectedStepId);
   }, [props.run?.events, selectedStepId, viewMode]);
+
+  const ragHits = useMemo(() => {
+    const events = props.run?.events ?? [];
+    const selected = events
+      .filter((event) => String(event.type ?? "") === "rag_hits_selected")
+      .flatMap((event) => (Array.isArray(event.hits) ? event.hits : []));
+    return selected.filter((item) => typeof item === "object") as Array<Record<string, unknown>>;
+  }, [props.run?.events]);
 
   async function copyAllLogs() {
     const text = filteredEvents
@@ -113,7 +116,7 @@ export default function TraceModal(props: Props) {
                   type="button"
                   className={`w-full text-left text-xs border rounded px-2 py-1 ${
                     props.traceId === id
-                      ? "border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300"
+                      ? "border-zinc-500 bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
                       : "border-zinc-200 dark:border-zinc-700"
                   }`}
                   onClick={() => void props.onSelectTrace(id)}
@@ -149,7 +152,7 @@ export default function TraceModal(props: Props) {
                   key={`${step.stepId ?? idx}`}
                   className={`w-full text-left text-xs border rounded px-2 py-1 ${
                     selectedStepId === (step.stepId ?? `s${idx + 1}`)
-                      ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40"
+                      ? "border-zinc-500 bg-zinc-100 dark:bg-zinc-800"
                       : "border-zinc-200 dark:border-zinc-700"
                   }`}
                   onClick={() =>
@@ -170,7 +173,7 @@ export default function TraceModal(props: Props) {
           <div className="border border-zinc-200 dark:border-zinc-700 rounded p-3">
             <div className="text-xs text-zinc-500 mb-2">Final Answer</div>
             {props.loading ? <div className="text-sm text-zinc-500">加载中...</div> : null}
-            {props.error ? <div className="text-sm text-red-600 dark:text-red-400">{props.error}</div> : null}
+            {props.error ? <div className="text-sm text-red-600">{props.error}</div> : null}
             {!props.loading && !props.error ? (
               <pre className="text-xs whitespace-pre-wrap break-words">{props.run?.finalAnswer || "-"}</pre>
             ) : null}
@@ -178,6 +181,22 @@ export default function TraceModal(props: Props) {
           <div className="border border-zinc-200 dark:border-zinc-700 rounded p-3">
             <div className="text-xs text-zinc-500 mb-2">Step Outputs</div>
             <pre className="text-xs whitespace-pre-wrap break-words">{pretty(props.run?.stepOutputs ?? {})}</pre>
+          </div>
+          <div className="border border-zinc-200 dark:border-zinc-700 rounded p-3">
+            <div className="text-xs text-zinc-500 mb-2">RAG Hits</div>
+            <div className="space-y-2 max-h-56 overflow-auto">
+              {ragHits.map((hit, idx) => (
+                <div key={`${String(hit.chunkId ?? hit.documentId ?? idx)}-${idx}`} className="border border-zinc-200 dark:border-zinc-700 rounded px-2 py-2">
+                  <div className="text-[11px] font-medium">
+                    {String(hit.documentId ?? "unknown")} / {String(hit.chunkId ?? "chunk")}
+                  </div>
+                  <div className="text-[10px] text-zinc-500">
+                    scope={String(hit.scope ?? "")} score={String(hit.score ?? "")}
+                  </div>
+                </div>
+              ))}
+              {!ragHits.length ? <div className="text-xs text-zinc-500">暂无 retrieval hits。</div> : null}
+            </div>
           </div>
           <div className="border border-zinc-200 dark:border-zinc-700 rounded p-3">
             <div className="flex items-center justify-between gap-2 mb-2">
@@ -219,7 +238,7 @@ export default function TraceModal(props: Props) {
                   key={`${String(event.type ?? "event")}-${idx}`}
                   className={`border rounded px-2 py-2 ${
                     selectedStepId && String(event.stepId ?? "") === selectedStepId
-                      ? "border-emerald-400 bg-emerald-50/70 dark:bg-emerald-950/30"
+                      ? "border-zinc-500 bg-zinc-100/90 dark:bg-zinc-800/80"
                       : "border-zinc-200 dark:border-zinc-700"
                   }`}
                 >
@@ -240,4 +259,9 @@ export default function TraceModal(props: Props) {
       </div>
     </AppModal>
   );
+}
+
+export default function TraceModal(props: Props) {
+  if (!props.open) return null;
+  return <TraceModalBody key={props.traceId ?? "empty-trace"} {...props} />;
 }

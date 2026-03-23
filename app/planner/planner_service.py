@@ -82,6 +82,34 @@ class PlannerService:
                 )
             )
 
+        web_fetch_url = self._extract_web_fetch_url(intent.user_query)
+        if web_fetch_url:
+            steps.append(
+                PlanStep(
+                    stepId=f"s{len(steps) + 1}",
+                    kind="tool",
+                    action=f"Fetch and extract readable content from `{web_fetch_url}`.",
+                    toolId="web-fetch",
+                    toolArgs={
+                        "url": web_fetch_url,
+                        "maxChars": 12000,
+                    },
+                    outputSchema={
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "finalUrl": {"type": "string"},
+                            "statusCode": {"type": "number"},
+                            "title": {"type": "string"},
+                            "contentType": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["url", "finalUrl", "statusCode", "title", "contentType", "content"],
+                    },
+                    agent="auto",
+                )
+            )
+
         if self._should_add_find_skills_tool(intent.user_query, recommended.get("recommendedSkills")):
             steps.append(
                 PlanStep(
@@ -191,3 +219,34 @@ class PlannerService:
             "topK": top_k if isinstance(top_k, int) and top_k > 0 else settings.rag_default_top_k,
             "minScore": float(min_score) if isinstance(min_score, (int, float)) else 0.12,
         }
+
+    def _extract_web_fetch_url(self, query: str) -> str:
+        q = query.strip()
+        match = re.search(r"https?://[^\s)>\]}\"']+", q, re.IGNORECASE)
+        if not match:
+            return ""
+
+        lowered = q.lower()
+        fetch_keywords = [
+            "read",
+            "fetch",
+            "open",
+            "page",
+            "website",
+            "url",
+            "link",
+            "summarize",
+            "crawl",
+            "网页",
+            "页面",
+            "网址",
+            "链接",
+            "读取",
+            "抓取",
+            "总结",
+            "看看",
+            "打开",
+        ]
+        if any(keyword in lowered for keyword in fetch_keywords):
+            return match.group(0).rstrip(".,;!?)]}")
+        return ""

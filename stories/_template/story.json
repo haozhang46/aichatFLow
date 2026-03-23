@@ -1,0 +1,32 @@
+{
+  "storyId": "story-001",
+  "title": "Untitled Story",
+  "status": "planning",
+  "storySize": "long",
+  "genre": "",
+  "tone": "",
+  "audience": "general",
+  "createdAt": "",
+  "updatedAt": "",
+  "tenantId": "tenant-a",
+  "rag": {
+    "enabled": true,
+    "scopes": [],
+    "knowledgeNeeds": []
+  },
+  "setting": {
+    "era": "",
+    "background": "",
+    "worldRules": [],
+    "mainConflict": ""
+  },
+  "characters": [],
+  "outline": [],
+  "chapters": [],
+  "currentChapterId": null,
+  "contextWindow": {
+    "recentChapters": [],
+    "activeCharacters": [],
+    "activeThreads": []
+  }
+}

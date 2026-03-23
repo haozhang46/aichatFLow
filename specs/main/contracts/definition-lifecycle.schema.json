@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aichatflow.local/schemas/definition-lifecycle.schema.json",
+  "title": "DefinitionLifecycle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "entityType",
+    "entityId",
+    "version",
+    "state",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "entityType": {
+      "type": "string",
+      "enum": ["tool", "agent"]
+    },
+    "entityId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "validated",
+        "validation_failed",
+        "registered",
+        "publish_pending",
+        "published",
+        "publish_rejected",
+        "disabled",
+        "deprecated"
+      ]
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["pending", "passed", "failed"]
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["not_required", "pending", "approved", "rejected"]
+        },
+        "reviewedBy": {
+          "type": "string"
+        },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "comment": {
+          "type": "string"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["manual", "llm_draft", "imported"]
+        },
+        "draftId": {
+          "type": "string"
+        }
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "publishedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

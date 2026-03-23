@@ -17,6 +17,24 @@ def _safe_list_tools(raw: Any) -> list[str]:
     return [str(x).strip() for x in raw if str(x).strip()]
 
 
+def _safe_tool_inputs(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for tool_id, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        normalized_tool_id = str(tool_id).strip()
+        if not normalized_tool_id:
+            continue
+        result[normalized_tool_id] = {
+            str(key).strip(): item
+            for key, item in value.items()
+            if str(key).strip()
+        }
+    return result
+
+
 def _execution_map(step_executions: Optional[list[Any]]) -> dict[int, dict[str, Any]]:
     m: dict[int, dict[str, Any]] = {}
     if not isinstance(step_executions, list):
@@ -40,7 +58,7 @@ def normalize_execution_steps(
 ) -> list[dict[str, Any]]:
     """
     Returns ordered steps:
-    { id, type, action, agent, skills, tools, dependsOn, retryPolicy, timeoutMs }
+    { id, type, action, agent, skills, tools, toolInputs, dependsOn, retryPolicy, timeoutMs }
     """
     step_overrides = step_overrides or {}
     ex_map = _execution_map(step_executions)
@@ -87,6 +105,7 @@ def normalize_execution_steps(
         agent = str(item.get("agent") or default_mode).strip() or default_mode
         skills = _safe_list_skills(item.get("skills"))
         tools = _safe_list_tools(item.get("tools"))
+        tool_inputs = _safe_tool_inputs(item.get("toolInputs"))
 
         merged = ex_map.get(idx)
         if isinstance(merged, dict):
@@ -97,6 +116,8 @@ def normalize_execution_steps(
             skills = _safe_list_skills(ms) if ms is not None else skills
             mt = merged.get("tools")
             tools = _safe_list_tools(mt) if mt is not None else tools
+            mti = merged.get("toolInputs")
+            tool_inputs = _safe_tool_inputs(mti) if mti is not None else tool_inputs
 
         retry = item.get("retryPolicy")
         if not isinstance(retry, dict):
@@ -117,6 +138,7 @@ def normalize_execution_steps(
                 "agent": agent,
                 "skills": skills,
                 "tools": tools,
+                "toolInputs": tool_inputs,
                 "retryPolicy": retry,
                 "timeoutMs": timeout_ms,
                 "outputSchema": output_schema,

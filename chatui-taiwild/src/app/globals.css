@@ -3,6 +3,17 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  --ui-graph-bg: #09090b;
+  --ui-graph-glow: #18181b;
+  --ui-surface: #ffffff;
+  --ui-surface-muted: #f4f4f5;
+  --ui-border: #d4d4d8;
+  --ui-text: #18181b;
+  --ui-text-muted: #52525b;
+  --ui-positive: #059669;
+  --ui-warning: #f59e0b;
+  --ui-normal: #2563eb;
+  --ui-error: #dc2626;
 }
 
 @theme inline {
@@ -23,6 +34,11 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+    --ui-surface: #09090b;
+    --ui-surface-muted: #18181b;
+    --ui-border: #3f3f46;
+    --ui-text: #f4f4f5;
+    --ui-text-muted: #a1a1aa;
   }
 }
 

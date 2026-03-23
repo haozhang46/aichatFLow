@@ -33,14 +33,17 @@ class Settings(BaseSettings):
         alias="WEATHER_FORECAST_BASE_URL",
     )
 
-    # Zep-backed RAG settings.
-    zep_base_url: str = Field(default="https://api.getzep.com", alias="ZEP_BASE_URL")
-    zep_api_key: str = Field(default="", alias="ZEP_API_KEY")
-    zep_collection_prefix: str = Field(default="aichatflow", alias="ZEP_COLLECTION_PREFIX")
-    zep_embedding_dimensions: int = Field(default=1536, alias="ZEP_EMBEDDING_DIMENSIONS")
+    # Local RAG settings: Ollama embeddings + LanceDB storage.
+    ollama_base_url: str = Field(default="http://127.0.0.1:11434", alias="OLLAMA_BASE_URL")
+    ollama_embed_model: str = Field(default="nomic-embed-text", alias="OLLAMA_EMBED_MODEL")
+    rag_vector_db_path: str = Field(default="", alias="RAG_VECTOR_DB_PATH")
     rag_chunk_size: int = Field(default=800, alias="RAG_CHUNK_SIZE")
     rag_chunk_overlap: int = Field(default=120, alias="RAG_CHUNK_OVERLAP")
     rag_default_top_k: int = Field(default=5, alias="RAG_DEFAULT_TOP_K")
+
+    # Trace storage: prefer RPC service when configured, otherwise fallback to local file store.
+    trace_rpc_url: str = Field(default="", alias="TRACE_RPC_URL")
+    trace_rpc_timeout_seconds: int = Field(default=5, alias="TRACE_RPC_TIMEOUT_SECONDS")
 
 
 settings = Settings()

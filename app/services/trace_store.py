@@ -1,18 +1,33 @@
-"""Append-only JSONL trace storage for execution events."""
+"""Trace storage with pluggable backend: RPC first, local JSONL fallback."""
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
+
+import httpx
+
+from app.core.config import settings
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class TraceStore:
+class TraceBackend(Protocol):
+    def append(self, trace_id: str, event: dict[str, Any]) -> None:
+        ...
+
+    def read_trace(self, trace_id: str) -> list[dict[str, Any]]:
+        ...
+
+    def find_by_request_id(self, request_id: str, limit: int = 20) -> list[str]:
+        ...
+
+
+class FileTraceBackend:
     def __init__(self, base_dir: Optional[Path] = None) -> None:
         root = Path(__file__).resolve().parents[2]
         self._dir = base_dir or (root / "data" / "traces")
@@ -47,7 +62,6 @@ class TraceStore:
         return out
 
     def find_by_request_id(self, request_id: str, limit: int = 20) -> list[str]:
-        """Scan trace files for matching requestId (MVP: linear scan, small dev volumes)."""
         matches: list[str] = []
         for path in sorted(self._dir.glob("*.jsonl"), reverse=True):
             try:
@@ -63,3 +77,63 @@ class TraceStore:
             except (OSError, json.JSONDecodeError):
                 continue
         return matches
+
+
+class RpcTraceBackend:
+    def __init__(self, base_url: str, timeout_seconds: float = 5.0) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+
+    def append(self, trace_id: str, event: dict[str, Any]) -> None:
+        payload = {"traceId": trace_id, "event": {"ts": _utc_now_iso(), "traceId": trace_id, **event}}
+        with httpx.Client(timeout=self._timeout_seconds) as client:
+            response = client.post(f"{self._base_url}/v1/traces/append", json=payload)
+            response.raise_for_status()
+
+    def read_trace(self, trace_id: str) -> list[dict[str, Any]]:
+        with httpx.Client(timeout=self._timeout_seconds) as client:
+            response = client.get(f"{self._base_url}/v1/traces/{trace_id}/events")
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+            payload = response.json()
+        events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(events, list):
+            return []
+        return [item for item in events if isinstance(item, dict)]
+
+    def find_by_request_id(self, request_id: str, limit: int = 20) -> list[str]:
+        with httpx.Client(timeout=self._timeout_seconds) as client:
+            response = client.get(
+                f"{self._base_url}/v1/traces",
+                params={"requestId": request_id, "limit": limit},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        trace_ids = payload.get("traceIds") if isinstance(payload, dict) else None
+        if not isinstance(trace_ids, list):
+            return []
+        return [str(item) for item in trace_ids if str(item).strip()]
+
+
+class TraceStore:
+    def __init__(self, base_dir: Optional[Path] = None) -> None:
+        self._backend = self._build_backend(base_dir=base_dir)
+
+    def append(self, trace_id: str, event: dict[str, Any]) -> None:
+        self._backend.append(trace_id, event)
+
+    def read_trace(self, trace_id: str) -> list[dict[str, Any]]:
+        return self._backend.read_trace(trace_id)
+
+    def find_by_request_id(self, request_id: str, limit: int = 20) -> list[str]:
+        return self._backend.find_by_request_id(request_id, limit=limit)
+
+    def backend_kind(self) -> str:
+        return "rpc" if isinstance(self._backend, RpcTraceBackend) else "file"
+
+    def _build_backend(self, *, base_dir: Optional[Path]) -> TraceBackend:
+        rpc_url = settings.trace_rpc_url.strip()
+        if rpc_url:
+            return RpcTraceBackend(rpc_url, timeout_seconds=float(settings.trace_rpc_timeout_seconds))
+        return FileTraceBackend(base_dir=base_dir)

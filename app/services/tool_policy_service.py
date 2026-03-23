@@ -53,6 +53,23 @@ class ToolPolicyService:
             "denylisted": tool_id in self._state["denylist"],
         }
 
+    def validate_invoke(self, tool_id: str) -> dict[str, object]:
+        allowlist = set(self._state["allowlist"])
+        denylist = set(self._state["denylist"])
+        if tool_id in denylist:
+            return {
+                "ok": False,
+                "code": "tool_not_allowed",
+                "message": f"tool `{tool_id}` is denylisted",
+            }
+        if allowlist and tool_id not in allowlist:
+            return {
+                "ok": False,
+                "code": "tool_not_allowed",
+                "message": f"tool `{tool_id}` is not in allowlist",
+            }
+        return {"ok": True}
+
     def set_policy(
         self,
         tool_id: str,

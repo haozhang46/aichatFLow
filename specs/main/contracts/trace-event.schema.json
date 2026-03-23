@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aichatflow.local/schemas/trace-event.schema.json",
+  "title": "TraceEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "traceId",
+    "runId",
+    "spanId",
+    "type",
+    "timestamp"
+  ],
+  "properties": {
+    "traceId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "spanId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parentSpanId": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "run_started",
+        "run_completed",
+        "step_started",
+        "step_completed",
+        "replanned",
+        "tool_call_started",
+        "tool_call_completed",
+        "tool_call_failed",
+        "file_read",
+        "file_write",
+        "file_delete",
+        "file_mkdir",
+        "file_patch",
+        "acl_denied",
+        "tool_registered",
+        "agent_registered",
+        "draft_published",
+        "definition_published"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "failed", "partial", "awaiting_approval"]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "agentId": {
+      "type": "string"
+    },
+    "toolId": {
+      "type": "string"
+    },
+    "userId": {
+      "type": "string"
+    },
+    "resourcePath": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

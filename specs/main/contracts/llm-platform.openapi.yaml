@@ -1,0 +1,729 @@
+openapi: 3.1.0
+info:
+  title: LLM Platform API
+  version: 0.1.0
+  description: >
+    Core platform contract for tool registration, agent registration, invoke,
+    file access, ACL management, and trace query.
+servers:
+  - url: http://127.0.0.1:3000
+paths:
+  /v1/tools:
+    get:
+      summary: List tools
+      operationId: listTools
+      responses:
+        '200':
+          description: Tool catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ToolManifest'
+    post:
+      summary: Register a tool
+      operationId: registerTool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolManifest'
+      responses:
+        '200':
+          description: Tool registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, tool]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  tool:
+                    $ref: '#/components/schemas/ToolManifest'
+  /v1/tools/draft:
+    post:
+      summary: Generate a tool draft from natural language
+      operationId: draftTool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt:
+                  type: string
+      responses:
+        '200':
+          description: Tool draft generated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, draft]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  draft:
+                    $ref: '#/components/schemas/ToolManifest'
+  /v1/tools/{toolId}:
+    get:
+      summary: Get tool manifest
+      operationId: getTool
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+      responses:
+        '200':
+          description: Tool manifest
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tool]
+                properties:
+                  tool:
+                    $ref: '#/components/schemas/ToolManifest'
+  /v1/tools/{toolId}/publish:
+    post:
+      summary: Publish a registered tool
+      operationId: publishTool
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+      responses:
+        '200':
+          description: Tool published
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, published]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  published:
+                    type: boolean
+  /v1/tools/{toolId}/invoke:
+    post:
+      summary: Invoke a tool
+      operationId: invokeTool
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                args:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Tool execution result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolInvokeResponse'
+
+  /v1/agents:
+    get:
+      summary: List agents
+      operationId: listAgents
+      responses:
+        '200':
+          description: Agent catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentSpec'
+    post:
+      summary: Register an agent
+      operationId: registerAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentSpec'
+      responses:
+        '200':
+          description: Agent registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, agent]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  agent:
+                    $ref: '#/components/schemas/AgentSpec'
+  /v1/agents/draft:
+    post:
+      summary: Generate an agent draft from natural language
+      operationId: draftAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt:
+                  type: string
+      responses:
+        '200':
+          description: Agent draft generated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, draft]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  draft:
+                    $ref: '#/components/schemas/AgentSpec'
+  /v1/agents/{agentId}:
+    get:
+      summary: Get agent spec
+      operationId: getAgent
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '200':
+          description: Agent spec
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agent]
+                properties:
+                  agent:
+                    $ref: '#/components/schemas/AgentSpec'
+  /v1/agents/{agentId}/publish:
+    post:
+      summary: Publish a registered agent
+      operationId: publishAgent
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '200':
+          description: Agent published
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, published]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  published:
+                    type: boolean
+  /v1/agents/{agentId}/invoke:
+    post:
+      summary: Invoke an agent
+      operationId: invokeAgent
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                input:
+                  type: object
+                  additionalProperties: true
+                context:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Agent run result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentInvokeResponse'
+
+  /v1/files:
+    get:
+      summary: Read file or list direct children
+      operationId: getFile
+      parameters:
+        - name: path
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File or directory payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileReadResponse'
+    put:
+      summary: Write file
+      operationId: putFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, content]
+              properties:
+                path:
+                  type: string
+                content:
+                  type: string
+      responses:
+        '200':
+          description: File saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileWriteResponse'
+    delete:
+      summary: Delete file or empty directory
+      operationId: deleteFile
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Path deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileDeleteResponse'
+  /v1/files/tree:
+    get:
+      summary: List file tree
+      operationId: getFileTree
+      parameters:
+        - name: path
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tree payload
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, rootPath, items]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  rootPath:
+                    type: string
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FileTreeItem'
+  /v1/files/acl:
+    get:
+      summary: List ACL rules
+      operationId: listFileAcl
+      parameters:
+        - name: userId
+          in: query
+          schema:
+            type: string
+        - name: path
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ACL rules
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, rules]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  rules:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FileAclRule'
+    post:
+      summary: Upsert ACL rule
+      operationId: upsertFileAcl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileAclRule'
+      responses:
+        '200':
+          description: ACL rule stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, rule]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  rule:
+                    $ref: '#/components/schemas/FileAclRule'
+    delete:
+      summary: Delete ACL rule
+      operationId: deleteFileAcl
+      parameters:
+        - name: userId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ACL rule deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, deleted]
+                properties:
+                  status:
+                    type: string
+                    const: success
+                  deleted:
+                    type: boolean
+
+  /v1/traces/{traceId}:
+    get:
+      summary: Get a trace
+      operationId: getTrace
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: Trace summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceResponse'
+  /v1/traces/{traceId}/events:
+    get:
+      summary: Get trace events
+      operationId: getTraceEvents
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: Trace events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [traceId, events]
+                properties:
+                  traceId:
+                    type: string
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TraceEvent'
+  /v1/runs/{runId}:
+    get:
+      summary: Get a run
+      operationId: getRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: Run payload
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runId, status]
+                properties:
+                  runId:
+                    type: string
+                  status:
+                    type: string
+                  traceId:
+                    type: string
+                  finalAnswer:
+                    type: string
+                  stepOutputs:
+                    type: object
+                    additionalProperties: true
+
+components:
+  parameters:
+    ToolId:
+      name: toolId
+      in: path
+      required: true
+      schema:
+        type: string
+    AgentId:
+      name: agentId
+      in: path
+      required: true
+      schema:
+        type: string
+    TraceId:
+      name: traceId
+      in: path
+      required: true
+      schema:
+        type: string
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    ToolManifest:
+      type: object
+      required: [id, name, description, version]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        version:
+          type: string
+        kind:
+          type: string
+          enum: [builtin, http, file, mcp, workflow]
+        inputSchema:
+          type: object
+          additionalProperties: true
+        outputSchema:
+          type: object
+          additionalProperties: true
+        uiSchema:
+          type: object
+          additionalProperties: true
+        auth:
+          type: object
+          additionalProperties: true
+        endpoint:
+          type: object
+          additionalProperties: true
+        policy:
+          type: object
+          additionalProperties: true
+    AgentSpec:
+      type: object
+      required: [id, name, description, version, systemPrompt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        version:
+          type: string
+        systemPrompt:
+          type: string
+        availableTools:
+          type: array
+          items:
+            type: string
+        runtime:
+          type: object
+          additionalProperties: true
+        memory:
+          type: object
+          additionalProperties: true
+        outputSchema:
+          type: object
+          additionalProperties: true
+        policy:
+          type: object
+          additionalProperties: true
+    ToolInvokeResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+        tool:
+          $ref: '#/components/schemas/ToolManifest'
+        args:
+          type: object
+          additionalProperties: true
+        result:
+          type: object
+          additionalProperties: true
+        error:
+          type: object
+          nullable: true
+          additionalProperties: true
+        latencyMs:
+          type: integer
+    AgentInvokeResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+        agent:
+          $ref: '#/components/schemas/AgentSpec'
+        runId:
+          type: string
+        traceId:
+          type: string
+        result:
+          type: object
+          additionalProperties: true
+        error:
+          type: object
+          nullable: true
+          additionalProperties: true
+    FileTreeItem:
+      type: object
+      required: [path, type]
+      properties:
+        path:
+          type: string
+        type:
+          type: string
+          enum: [file, dir]
+    FileReadResponse:
+      type: object
+      required: [status, path, type]
+      properties:
+        status:
+          type: string
+          const: success
+        path:
+          type: string
+        type:
+          type: string
+          enum: [file, dir]
+        content:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    FileWriteResponse:
+      type: object
+      required: [status, path, saved]
+      properties:
+        status:
+          type: string
+          const: success
+        path:
+          type: string
+        type:
+          type: string
+        saved:
+          type: boolean
+    FileDeleteResponse:
+      type: object
+      required: [status, path, deleted]
+      properties:
+        status:
+          type: string
+          const: success
+        path:
+          type: string
+        type:
+          type: string
+        deleted:
+          type: boolean
+    FileAclRule:
+      type: object
+      required: [userId, path, permissions]
+      properties:
+        userId:
+          type: string
+        path:
+          type: string
+        permissions:
+          type: array
+          items:
+            type: string
+            enum: [read, write, delete]
+    TraceResponse:
+      type: object
+      required: [traceId]
+      properties:
+        traceId:
+          type: string
+        runId:
+          type: string
+        status:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceEvent'
+    TraceEvent:
+      type: object
+      required: [type, timestamp]
+      properties:
+        traceId:
+          type: string
+        runId:
+          type: string
+        spanId:
+          type: string
+        parentSpanId:
+          type: string
+        type:
+          type: string
+        status:
+          type: string
+        timestamp:
+          type: string
+        agentId:
+          type: string
+        toolId:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true

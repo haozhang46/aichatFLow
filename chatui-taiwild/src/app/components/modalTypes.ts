@@ -56,10 +56,20 @@ export type PlanHistoryItem = {
   lastTraceId?: string;
 };
 
+export type ToolRequiredInput = {
+  key: string;
+  label: string;
+  type?: "text" | "password" | "textarea";
+  required?: boolean;
+  secret?: boolean;
+  placeholder?: string;
+};
+
 export type CapabilityAgent = {
   id: string;
   label: string;
   description: string;
+  source?: string | { type?: string; path?: string };
 };
 
 export type CapabilitySkill = {
@@ -89,6 +99,33 @@ export type CapabilityTool = {
   builtin?: boolean;
   allowlisted?: boolean;
   denylisted?: boolean;
+  inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  exampleArgs?: Record<string, unknown>;
+  requiredUserInputs?: ToolRequiredInput[];
+  uiPlugin?: string | null;
+  uiSchema?: {
+    layout?: string;
+    fields?: Array<{
+      key: string;
+      label: string;
+      component?: string;
+      placeholder?: string;
+      rows?: number;
+      min?: number;
+      max?: number;
+      step?: number;
+      options?: Array<{
+        label: string;
+        value: string;
+      }>;
+    }>;
+    actions?: Array<{
+      key: string;
+      label: string;
+      type?: string;
+    }>;
+  } | null;
 };
 
 export type DeepSeekConfig = {

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from uuid import uuid4
 from datetime import datetime
 import json
@@ -5,7 +7,7 @@ import time
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,14 +15,18 @@ from app.api.deps import (
     agent_registry_service,
     approval_store,
     capability_service,
+    deepagent_runtime_adapter,
     executor_service,
     metrics_service,
     personal_skill_tree_service,
     plan_record_service,
+    platform_trace_service,
     routing_service,
     skill_executor_service,
+    tool_definition_registry_service,
     trace_store,
     otie_runtime,
+    otie_trace_service,
     otie_intent_service,
     otie_planner,
     tool_registry,
@@ -31,8 +37,10 @@ from app.schemas.unified import UnifiedRequest
 from app.services.execution_steps import normalize_execution_steps
 from app.orchestrator.graph import (
     build_plan_context,
+    run_orchestrator,
 )
 from app.core.config import settings
+from app.runtime.deepagent_adapter import DeepAgentInvokeContext, DeepAgentInvokeRequest
 from app.services.clawhub_service import search_skills as clawhub_search_skills
 from app.services.clawhub_plan_analysis import build_clawhub_plan_suggestions
 
@@ -68,8 +76,30 @@ class OnlineSkillAddIn(BaseModel):
 
 class AgentCreateIn(BaseModel):
     agent_id: str = Field(alias="agentId")
-    label: str
+    label: str = ""
     description: str = ""
+    system_prompt: str = Field(default="", alias="systemPrompt")
+    version: str = "0.1.0"
+    available_tools: list[str] = Field(default_factory=list, alias="availableTools")
+    runtime: Optional[dict[str, Any]] = None
+    memory: Optional[dict[str, Any]] = None
+    policy: Optional[dict[str, Any]] = None
+
+
+class ToolRegisterIn(BaseModel):
+    manifest: dict[str, Any] | None = None
+
+
+class DraftPromptIn(BaseModel):
+    prompt: str
+
+
+class AgentInvokeIn(BaseModel):
+    prompt: Optional[str] = None
+    input: Optional[dict[str, Any]] = None
+    context: Optional[dict[str, Any]] = None
+    runtime_options: Optional[dict[str, Any]] = Field(default=None, alias="runtimeOptions")
+    llm_config: Optional[dict[str, str]] = Field(default=None, alias="llmConfig")
 
 
 class PersonalSkillPathIn(BaseModel):
@@ -165,14 +195,87 @@ def _coerce_step_strategy(step_agent: str, fallback: str) -> str:
 
 
 def _build_otie_request(payload: UnifiedRequest, query: str) -> OtieRequestInput:
+    metadata = dict(payload.metadata or {})
     return OtieRequestInput(
         requestId=payload.request_id,
         tenantId=payload.tenant_id,
         requestType=payload.request_type,
         messages=[{"role": "user", "content": query}],
         inputs=payload.inputs or {},
-        metadata=payload.metadata or {},
+        metadata=metadata,
     )
+
+
+def _current_user_id(request: Request) -> str:
+    for key in ("user_id", "userId", "uid", "session_user", "sessionUser"):
+        value = request.cookies.get(key)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def _known_agent_ids() -> set[str]:
+    builtin = {str(item.get("id") or "").strip() for item in capability_service.list_agents()}
+    custom = {str(item.get("id") or "").strip() for item in agent_registry_service.list_registered_agents()}
+    return {item for item in builtin | custom if item}
+
+
+def _validate_tool_manifest_policy(manifest: dict[str, Any]) -> Optional[str]:
+    policy = manifest.get("policy") if isinstance(manifest.get("policy"), dict) else {}
+    allow_agents = policy.get("allowAgents") if isinstance(policy.get("allowAgents"), list) else []
+    if not allow_agents:
+        return None
+    known_agent_ids = _known_agent_ids()
+    missing = [str(item).strip() for item in allow_agents if str(item).strip() and str(item).strip() not in known_agent_ids]
+    if missing:
+        return f"tool policy.allowAgents contains unknown agent ids: {', '.join(sorted(missing))}"
+    return None
+
+
+def _validate_agent_available_tools(agent_id: str, available_tools: list[str]) -> Optional[str]:
+    normalized_agent_id = str(agent_id or "").strip()
+    for tool_id in [str(item).strip() for item in available_tools if str(item).strip()]:
+        if not tool_registry.has_tool(tool_id):
+            return f"agent availableTools contains unknown tool `{tool_id}`"
+        tool_meta = tool_registry.describe_tool(tool_id) or {"id": tool_id}
+        policy = tool_meta.get("policy") if isinstance(tool_meta.get("policy"), dict) else {}
+        allow_agents = policy.get("allowAgents") if isinstance(policy.get("allowAgents"), list) else []
+        if allow_agents and normalized_agent_id not in {str(item).strip() for item in allow_agents if str(item).strip()}:
+            return f"tool `{tool_id}` is not allowed for agent `{normalized_agent_id}`"
+    return None
+
+
+def _normalize_agent_spec(payload: AgentCreateIn) -> dict[str, Any]:
+    agent_id = payload.agent_id.strip()
+    name = payload.label.strip() or agent_id
+    runtime = payload.runtime if isinstance(payload.runtime, dict) else {"mode": "agent", "maxSteps": 8}
+    runtime = {**runtime}
+    runtime.setdefault("engine", "otie")
+    return {
+        "id": agent_id,
+        "name": name,
+        "description": payload.description.strip() or f"Custom agent `{agent_id}`",
+        "version": payload.version.strip() or "0.1.0",
+        "systemPrompt": payload.system_prompt.strip(),
+        "availableTools": [str(item).strip() for item in payload.available_tools if str(item).strip()],
+        "runtime": runtime,
+        "memory": payload.memory if isinstance(payload.memory, dict) else {"type": "none"},
+        "policy": payload.policy if isinstance(payload.policy, dict) else {"requiresUserContext": False},
+    }
+
+
+def _normalize_agent_invoke_request(payload: AgentInvokeIn) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    raw_input = payload.input if isinstance(payload.input, dict) else {}
+    prompt = str(payload.prompt or raw_input.get("message") or raw_input.get("prompt") or "").strip()
+    context = payload.context if isinstance(payload.context, dict) else {}
+    runtime_options = payload.runtime_options if isinstance(payload.runtime_options, dict) else {}
+    return prompt, context, runtime_options
+
+
+def _agent_runtime_engine(record: dict[str, Any] | None) -> str:
+    runtime = record.get("runtime") if isinstance((record or {}).get("runtime"), dict) else {}
+    engine = str(runtime.get("engine") or "otie").strip().lower()
+    return engine if engine in {"otie", "deepagent"} else "otie"
 
 
 def _build_otie_plan_from_steps(
@@ -187,6 +290,7 @@ def _build_otie_plan_from_steps(
         step_id = str(step.get("id") or f"s{idx + 1}")
         skills = [str(s).strip() for s in (step.get("skills") or []) if str(s).strip()]
         tools = [str(t).strip() for t in (step.get("tools") or []) if str(t).strip()]
+        tool_inputs = step.get("toolInputs") if isinstance(step.get("toolInputs"), dict) else {}
         depends_on = [str(s) for s in (step.get("dependsOn") or []) if str(s).strip()]
         for skill_index, skill_id in enumerate(skills):
             skill_step_id = f"{step_id}_tool_{skill_index + 1}"
@@ -213,7 +317,10 @@ def _build_otie_plan_from_steps(
                     action=f"Execute tool `{tool_id}` for step `{step_id}`.",
                     dependsOn=tool_depends,
                     toolId=tool_id,
-                    toolArgs={"query": str(step.get("action") or "")},
+                    toolArgs={
+                        "query": str(step.get("action") or ""),
+                        **(tool_inputs.get(tool_id) if isinstance(tool_inputs.get(tool_id), dict) else {}),
+                    },
                     agent="auto",
                 )
             )
@@ -266,8 +373,13 @@ async def _resolve_otie_plan_for_payload(
     *,
     query: str,
     strategy: str,
+    current_user_id: str = "",
 ) -> tuple[OtieRequestInput, Any, ExecutionPlan]:
-    otie_request = _build_otie_request(payload, query)
+    metadata = dict(payload.metadata or {})
+    if current_user_id:
+        metadata["currentUserId"] = current_user_id
+    payload_with_user = payload.model_copy(update={"metadata": metadata})
+    otie_request = _build_otie_request(payload_with_user, query)
     intent = otie_intent_service.normalize(otie_request)
 
     execution_plan = (payload.inputs or {}).get("executionPlan")
@@ -301,13 +413,18 @@ async def _resolve_otie_plan_for_payload(
 
 
 @router.post("/v1/unified/execute")
-async def execute_unified(payload: UnifiedRequest):
+async def execute_unified(payload: UnifiedRequest, request: Request):
     # For chat requests, use LangChain/LangGraph orchestrator to select agent/react/workflow automatically.
     if payload.request_type == "chat":
         query = (payload.messages or [{"content": ""}])[0].get("content", "")
         strategy = _get_strategy(payload)
         started = time.monotonic()
-        _, intent, plan = await _resolve_otie_plan_for_payload(payload, query=query, strategy=strategy)
+        _, intent, plan = await _resolve_otie_plan_for_payload(
+            payload,
+            query=query,
+            strategy=strategy,
+            current_user_id=_current_user_id(request),
+        )
         result = await otie_runtime.run(
             intent,
             plan,
@@ -561,15 +678,77 @@ async def add_online_capability(payload: OnlineSkillAddIn) -> dict[str, Any]:
 
 @router.get("/v1/agents")
 async def list_agents_registry() -> dict[str, Any]:
+    # Use capability-shaped rows (string `source`, etc.) — same as /v1/capabilities `agents` custom entries.
     return {"items": agent_registry_service.list_agents()}
 
 
 @router.post("/v1/agents")
+@router.post("/v1/agents/register")
 async def create_agent_registry(payload: AgentCreateIn) -> dict[str, Any]:
-    result = agent_registry_service.create_agent(payload.agent_id, payload.label, payload.description)
+    agent_spec = _normalize_agent_spec(payload)
+    available_tools_error = _validate_agent_available_tools(str(agent_spec.get("id") or ""), agent_spec["availableTools"])
+    if available_tools_error:
+        raise HTTPException(status_code=400, detail=available_tools_error)
+    if payload.system_prompt.strip() or payload.available_tools or payload.runtime or payload.memory or payload.policy:
+        result = agent_registry_service.register_agent(agent_spec)
+    else:
+        result = agent_registry_service.create_agent(payload.agent_id, payload.label, payload.description)
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["message"])
-    return {"status": "success", "agent": result["agent"]}
+    trace_id = platform_trace_service.new_trace_id("agentreg")
+    platform_trace_service.emit(
+        trace_id,
+        "agent_registered",
+        run_id=trace_id,
+        status="success",
+        agentId=str(result["agent"].get("id") or payload.agent_id),
+        metadata={"version": result["agent"].get("version"), "status": result["agent"].get("status")},
+    )
+    return {"status": "success", "agent": result["agent"], "traceId": trace_id}
+
+
+@router.post("/v1/agents/draft")
+async def create_agent_draft(payload: DraftPromptIn) -> dict[str, Any]:
+    result = agent_registry_service.create_draft(payload.prompt)
+    if "draft" not in result:
+        raise HTTPException(status_code=400, detail=result.get("message") or "failed to create agent draft")
+    return {"status": "success", "draft": result["draft"]}
+
+
+@router.get("/v1/agents/{agent_id}")
+async def get_agent_registry(agent_id: str) -> dict[str, Any]:
+    builtin = next((item for item in capability_service.list_agents() if item["id"] == agent_id), None)
+    if builtin is not None:
+        return {"agent": builtin}
+    agent = agent_registry_service.get_agent_record(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"agent `{agent_id}` not found")
+    return {"agent": agent}
+
+
+@router.post("/v1/agents/{agent_id}/publish")
+async def publish_agent_registry(agent_id: str) -> dict[str, Any]:
+    result = agent_registry_service.publish_agent(agent_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    trace_id = platform_trace_service.new_trace_id("agentpub")
+    platform_trace_service.emit(
+        trace_id,
+        "draft_published",
+        run_id=trace_id,
+        status="success",
+        agentId=str(result["agent"].get("id") or agent_id),
+        metadata={"entityType": "agent", "version": result["agent"].get("version")},
+    )
+    platform_trace_service.emit(
+        trace_id,
+        "definition_published",
+        run_id=trace_id,
+        status="success",
+        agentId=str(result["agent"].get("id") or agent_id),
+        metadata={"entityType": "agent", "version": result["agent"].get("version")},
+    )
+    return {"status": "success", "agent": result["agent"], "traceId": trace_id}
 
 
 @router.delete("/v1/agents/{agent_id}")
@@ -578,6 +757,249 @@ async def delete_agent_registry(agent_id: str) -> dict[str, Any]:
     if not result["ok"]:
         raise HTTPException(status_code=404, detail=result["message"])
     return {"status": "success"}
+
+
+@router.post("/v1/agents/{agent_id}/invoke")
+async def invoke_agent(agent_id: str, payload: AgentInvokeIn, request: Request) -> dict[str, Any]:
+    prompt, request_context, runtime_options = _normalize_agent_invoke_request(payload)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    builtin = next((item for item in capability_service.list_agents() if item["id"] == agent_id), None)
+    custom_record = agent_registry_service.get_agent_record(agent_id) if builtin is None else None
+    custom = agent_registry_service.get_agent(agent_id) if builtin is None else None
+    agent = builtin or custom
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"agent `{agent_id}` not found")
+
+    strategy = agent_id if agent_id in {"agent", "react", "workflow"} else "agent"
+    effective_prompt = prompt
+    effective_available_tools: list[str] = []
+    runtime_engine = "otie"
+    if custom_record is not None:
+        runtime = custom_record.get("runtime") if isinstance(custom_record.get("runtime"), dict) else {}
+        runtime_mode = str(runtime.get("mode") or "").strip()
+        runtime_engine = _agent_runtime_engine(custom_record)
+        if runtime_mode in {"agent", "react", "workflow"}:
+            strategy = runtime_mode
+        system_prompt = str(custom_record.get("systemPrompt") or "").strip()
+        agent_name = str(custom_record.get("name") or custom_record.get("label") or agent_id)
+        agent_desc = str(custom_record.get("description") or "")
+        available_tools = custom_record.get("availableTools") if isinstance(custom_record.get("availableTools"), list) else []
+        effective_available_tools = [str(item).strip() for item in available_tools if str(item).strip()]
+        available_tools_error = _validate_agent_available_tools(agent_id, effective_available_tools)
+        if available_tools_error:
+            raise HTTPException(status_code=400, detail=available_tools_error)
+        effective_prompt = (
+            f"You are the custom agent `{agent_name}`.\n"
+            + f"Agent profile: {agent_desc}\n"
+            + (f"Available tools: {', '.join(effective_available_tools)}\n" if effective_available_tools else "")
+            + (f"System instructions:\n{system_prompt}\n\n" if system_prompt else "\n")
+            + f"User request:\n{prompt}"
+        )
+
+    trace_id = platform_trace_service.new_trace_id("agent")
+    span_id = platform_trace_service.new_span_id("agentinvoke")
+    try:
+        if runtime_engine == "deepagent":
+            result = await deepagent_runtime_adapter.invoke(
+                custom_record or {},
+                request=DeepAgentInvokeRequest(
+                    input={"message": prompt},
+                    context=request_context,
+                    runtime_options=runtime_options,
+                    llm_config=payload.llm_config,
+                ),
+                context=DeepAgentInvokeContext(
+                    trace_id=trace_id,
+                    run_id=trace_id,
+                    user_id=_current_user_id(request),
+                    agent_id=agent_id,
+                    tenant_id=str(request_context.get("tenantId") or "").strip() or None,
+                    allowed_tool_ids=effective_available_tools,
+                ),
+            )
+        else:
+            platform_trace_service.emit(
+                trace_id,
+                "run_started",
+                run_id=trace_id,
+                span_id=span_id,
+                status="running",
+                agentId=agent_id,
+                metadata={
+                    "prompt": prompt[:500],
+                    "strategy": strategy,
+                    "context": request_context,
+                    "runtimeOptions": runtime_options,
+                    "availableTools": effective_available_tools,
+                    "runtimeEngine": runtime_engine,
+                },
+            )
+            mode, answer, latency_ms = await run_orchestrator(
+                effective_prompt,
+                strategy=strategy,  # type: ignore[arg-type]
+                llm_config=payload.llm_config,
+            )
+            result = None
+    except Exception as exc:
+        platform_trace_service.emit(
+            trace_id,
+            "run_completed",
+            run_id=trace_id,
+            span_id=platform_trace_service.new_span_id("agentinvoke"),
+            parent_span_id=span_id,
+            status="failed",
+            agentId=agent_id,
+            metadata={"error": {"message": str(exc)}},
+        )
+        return {
+            "status": "failed",
+            "agent": agent,
+            "request": {
+                "input": {"message": prompt},
+                "context": request_context,
+                "runtimeOptions": runtime_options,
+                "strategy": strategy,
+                "llmConfig": payload.llm_config,
+                "availableTools": effective_available_tools,
+                "runtimeEngine": runtime_engine,
+            },
+            "result": None,
+            "error": {"code": "agent_invoke_failed", "message": str(exc)},
+            "latencyMs": 0,
+            "traceId": trace_id,
+        }
+    if runtime_engine == "deepagent":
+        assert result is not None
+        mode = result.mode
+        answer = result.answer
+        latency_ms = result.latency_ms
+        if result.status != "success":
+            return {
+                "status": "failed",
+                "agent": agent,
+                "request": {
+                    "input": {"message": prompt},
+                    "context": request_context,
+                    "runtimeOptions": runtime_options,
+                    "strategy": strategy,
+                    "llmConfig": payload.llm_config,
+                    "availableTools": effective_available_tools,
+                    "runtimeEngine": runtime_engine,
+                },
+                "result": None,
+                "stepOutputs": result.step_outputs,
+                "events": result.events,
+                "error": result.error,
+                "latencyMs": latency_ms,
+                "traceId": trace_id,
+            }
+    else:
+        platform_trace_service.emit(
+            trace_id,
+            "run_completed",
+            run_id=trace_id,
+            span_id=platform_trace_service.new_span_id("agentinvoke"),
+            parent_span_id=span_id,
+            status="success",
+            agentId=agent_id,
+            metadata={"mode": mode, "latencyMs": latency_ms},
+        )
+    return {
+        "status": "success",
+        "agent": agent,
+        "request": {
+            "input": {"message": prompt},
+            "context": request_context,
+            "runtimeOptions": runtime_options,
+            "strategy": strategy,
+            "llmConfig": payload.llm_config,
+            "availableTools": effective_available_tools,
+            "runtimeEngine": runtime_engine,
+        },
+        "result": {
+            "mode": mode,
+            "answer": answer,
+        },
+        "stepOutputs": result.step_outputs if runtime_engine == "deepagent" and result is not None else {},
+        "events": result.events if runtime_engine == "deepagent" and result is not None else [],
+        "error": None,
+        "latencyMs": latency_ms,
+        "traceId": trace_id,
+    }
+
+
+@router.get("/v1/tools")
+async def list_registered_tools() -> dict[str, Any]:
+    builtin_items = tool_registry.describe_tools()
+    custom_items = tool_definition_registry_service.list_tools()
+    return {"items": builtin_items + custom_items}
+
+
+@router.post("/v1/tools/draft")
+async def create_tool_draft(payload: DraftPromptIn) -> dict[str, Any]:
+    result = tool_definition_registry_service.create_draft(payload.prompt)
+    if "draft" not in result:
+        raise HTTPException(status_code=400, detail=result.get("message") or "failed to create tool draft")
+    return {"status": "success", "draft": result["draft"]}
+
+
+@router.post("/v1/tools")
+@router.post("/v1/tools/register")
+async def register_tool_definition(payload: dict[str, Any]) -> dict[str, Any]:
+    policy_error = _validate_tool_manifest_policy(payload)
+    if policy_error:
+        raise HTTPException(status_code=400, detail=policy_error)
+    result = tool_definition_registry_service.register_tool(payload)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    trace_id = platform_trace_service.new_trace_id("toolreg")
+    platform_trace_service.emit(
+        trace_id,
+        "tool_registered",
+        run_id=trace_id,
+        status="success",
+        toolId=str(result["tool"].get("id") or payload.get("id") or ""),
+        metadata={"version": result["tool"].get("version"), "status": result["tool"].get("status")},
+    )
+    return {"status": "success", "tool": result["tool"], "traceId": trace_id}
+
+
+@router.get("/v1/tools/{tool_id}")
+async def get_tool_definition(tool_id: str) -> dict[str, Any]:
+    builtin = tool_registry.describe_tool(tool_id)
+    if builtin is not None:
+        return {"tool": builtin}
+    tool = tool_definition_registry_service.get_tool(tool_id)
+    if tool is None:
+        raise HTTPException(status_code=404, detail=f"tool `{tool_id}` not found")
+    return {"tool": tool}
+
+
+@router.post("/v1/tools/{tool_id}/publish")
+async def publish_tool_definition(tool_id: str) -> dict[str, Any]:
+    result = tool_definition_registry_service.publish_tool(tool_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    trace_id = platform_trace_service.new_trace_id("toolpub")
+    platform_trace_service.emit(
+        trace_id,
+        "draft_published",
+        run_id=trace_id,
+        status="success",
+        toolId=str(result["tool"].get("id") or tool_id),
+        metadata={"entityType": "tool", "version": result["tool"].get("version")},
+    )
+    platform_trace_service.emit(
+        trace_id,
+        "definition_published",
+        run_id=trace_id,
+        status="success",
+        toolId=str(result["tool"].get("id") or tool_id),
+        metadata={"entityType": "tool", "version": result["tool"].get("version")},
+    )
+    return {"status": "success", "tool": result["tool"], "traceId": trace_id}
 
 
 @router.get("/v1/personal-skills/tree")
@@ -732,6 +1154,31 @@ async def get_trace(trace_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="trace not found")
     approvals = approval_store.list_for_trace(trace_id)
     return {"traceId": trace_id, "events": events, "approvals": approvals}
+
+
+@router.get("/v1/traces/{trace_id}/events")
+async def get_trace_events(trace_id: str) -> dict[str, Any]:
+    events = trace_store.read_trace(trace_id)
+    if not events:
+        raise HTTPException(status_code=404, detail="trace not found")
+    return {"traceId": trace_id, "events": events}
+
+
+@router.get("/v1/runs/{run_id}")
+async def get_run_trace(run_id: str) -> dict[str, Any]:
+    run = otie_trace_service.get_run(run_id)
+    if run is None:
+        events = trace_store.read_trace(run_id)
+        if not events:
+            raise HTTPException(status_code=404, detail="run not found")
+        latest = events[-1]
+        return {
+            "runId": run_id,
+            "status": latest.get("status") or "unknown",
+            "traceId": run_id,
+            "events": events,
+        }
+    return run
 
 
 @router.get("/v1/traces")
