@@ -38,3 +38,24 @@ npm run dev
 ```
 
 更多说明见 `specs/main/quickstart.md`、`docs/REPO_LAYOUT.md`。
+
+## Docker Compose 部署
+
+适合线上或服务器自托管部署：
+
+```bash
+cp .env.compose.example .env.compose
+docker compose build
+docker compose up -d
+```
+
+默认暴露：
+
+- 前端：`http://<host>:3001`
+- 后端：`http://<host>:3000`
+
+说明：
+
+- 前端容器通过 `NEXT_PUBLIC_API_BASE_URL` 访问后端，默认走 compose 内部地址 `http://api:3000`
+- `data/` 与 `stories/` 已挂载为持久化目录
+- 若服务器上有 Ollama，`OLLAMA_BASE_URL` 可保持为 `http://host.docker.internal:11434`；Linux 下通常需改成宿主机实际 IP 或额外配置 host-gateway

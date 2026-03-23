@@ -1,0 +1,39 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aichatflow-api
+    restart: unless-stopped
+    env_file:
+      - .env.compose
+    environment:
+      PORT: 3000
+      RAG_VECTOR_DB_PATH: /app/data/rag/lancedb
+    volumes:
+      - ./data:/app/data
+      - ./stories:/app/stories
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: ./chatui-taiwild
+      dockerfile: Dockerfile
+      args: {}
+    container_name: aichatflow-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      PORT: 3001
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://api:3000}
+    ports:
+      - "3001:3001"
