@@ -13,6 +13,7 @@ import type {
 } from "@/app/components/modalTypes";
 import type { FolderAuthorization, PlannedChatPayload, StepRunState } from "@/app/types/shared";
 import { EXECUTION_MODES } from "@/lib/app-enums";
+import { branchInputKey } from "@/lib/plan-branch";
 import type { ChatMessage } from "@/app/hooks/useChatController";
 
 type Params = {
@@ -35,10 +36,6 @@ function normalizePermission(input: string) {
 
 function newBranchId() {
   return `b_${Math.random().toString(16).slice(2)}_${Date.now()}`;
-}
-
-function branchInputKey(stepIndex: number, parentId: string | null) {
-  return `${stepIndex}:${parentId ?? "__root__"}`;
 }
 
 export function usePendingPlanController({

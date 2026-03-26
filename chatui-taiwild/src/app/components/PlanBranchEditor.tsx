@@ -3,6 +3,7 @@
 import type { Dispatch, SetStateAction } from "react";
 import AppButton from "@/components/ui/AppButton";
 import type { PlanBranchNode, PlanHistoryItem } from "./modalTypes";
+import { branchInputKey } from "@/lib/plan-branch";
 
 type Props = {
   stepIndex: number;
@@ -19,10 +20,6 @@ type Props = {
   setPlanBranchInput: Dispatch<SetStateAction<Record<string, string>>>;
   addPlanBranch: (stepIndex: number, parentId: string | null) => void;
 };
-
-function branchInputKey(stepIndex: number, parentId: string | null) {
-  return `${stepIndex}:${parentId ?? "__root__"}`;
-}
 
 export default function PlanBranchEditor({
   stepIndex,
