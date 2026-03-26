@@ -96,7 +96,12 @@ def test_unified_stream_executes_via_otie_runtime():
     assert resp.status_code == 200
     text = resp.text
     assert '"type": "trace"' in text
+    assert '"type": "run_started"' in text
+    assert '"type": "step_started"' in text
+    assert '"stepName": "Execute skill `find-skills` for step `s1`."' in text
     assert '"type": "tool_call"' in text
+    assert '"type": "step_completed"' in text
+    assert '"type": "run_completed"' in text
     assert '"type": "done"' in text
 
 
@@ -630,6 +635,147 @@ def test_story_agent_deepagent_hydrates_file_memory_and_prefetches_retrieval():
     assert any(tool_id == "file-patch" and args["path"] == "story-demo/notes.md" for tool_id, args in writebacks)
 
 
+def test_deepagent_runtime_executes_tool_loop_and_feeds_tool_results_back():
+    client = TestClient(app)
+    agent_id = "deepagent-tool-loop"
+    agent_path = Path("data/registry/agents/deepagent-tool-loop.json")
+    prompts: list[str] = []
+
+    async def fake_tool_execute(tool_id, args, *, user_id, agent_id, allowed_tool_ids, trace_id, parent_span_id=None):
+        assert tool_id == "weather"
+        assert args["location"] == "Shanghai"
+        return {"location": {"name": "Shanghai"}, "current": {"temperature": 23}}
+
+    async def fake_run_orchestrator(query: str, strategy: str = "auto", llm_config=None):
+        prompts.append(query)
+        if "Tool results:" not in query:
+            return "agent", '{"type":"tool_call","tool":"weather","args":{"location":"Shanghai"}}', 8
+        assert '"tool": "weather"' in query
+        assert '"temperature": 23' in query
+        return "agent", "Shanghai is currently 23C.", 9
+
+    import app.api.routes.unified as unified
+
+    try:
+        created = client.post(
+            "/v1/agents/register",
+            json={
+                "agentId": agent_id,
+                "label": "DeepAgent Tool Loop",
+                "description": "DeepAgent runtime with iterative tool calling.",
+                "systemPrompt": "Use tools when needed.",
+                "availableTools": ["weather"],
+                "runtime": {"mode": "agent", "engine": "deepagent", "maxToolCalls": 3},
+            },
+        )
+        assert created.status_code == 200
+
+        published = client.post(f"/v1/agents/{agent_id}/publish")
+        assert published.status_code == 200
+
+        with patch.object(
+            unified.deepagent_runtime_adapter._tool_adapter,
+            "execute",
+            side_effect=fake_tool_execute,
+        ), patch("app.runtime.deepagent_adapter.run_orchestrator", side_effect=fake_run_orchestrator):
+            resp = client.post(
+                f"/v1/agents/{agent_id}/invoke",
+                json={"input": {"message": "What's the weather in Shanghai?"}},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["result"]["answer"] == "Shanghai is currently 23C."
+        assert any(item["type"] == "tool_call" and item["toolId"] == "weather" for item in body["events"])
+        assert any(item["type"] == "tool_result" and item["toolId"] == "weather" for item in body["events"])
+        assert body["stepOutputs"]["tool_1"]["result"]["current"]["temperature"] == 23
+        assert len(prompts) == 2
+    finally:
+        if agent_path.exists():
+            agent_path.unlink()
+
+
+def test_deepagent_runtime_supports_file_read_then_file_write_loop():
+    client = TestClient(app)
+    agent_id = "deepagent-file-loop"
+    agent_path = Path("data/registry/agents/deepagent-file-loop.json")
+    prompts: list[str] = []
+    tool_calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_tool_execute(tool_id, args, *, user_id, agent_id, allowed_tool_ids, trace_id, parent_span_id=None):
+        tool_calls.append((tool_id, args))
+        if tool_id == "file-read":
+            return {
+                "path": "stories/demo/note.md",
+                "type": "file",
+                "content": "draft note",
+            }
+        if tool_id == "file-write":
+            assert args["path"] == "demo/note.md"
+            assert "polished note" in str(args["content"])
+            return {
+                "path": "stories/demo/note.md",
+                "type": "file",
+                "saved": True,
+            }
+        raise AssertionError(f"unexpected tool: {tool_id}")
+
+    async def fake_run_orchestrator(query: str, strategy: str = "auto", llm_config=None):
+        prompts.append(query)
+        if "Tool results:" not in query:
+            return "agent", '{"type":"tool_call","tool":"file-read","args":{"path":"demo/note.md"}}', 8
+        if '"tool": "file-read"' in query and '"tool": "file-write"' not in query:
+            assert '"content": "draft note"' in query
+            return "agent", '{"type":"tool_call","tool":"file-write","args":{"path":"demo/note.md","content":"polished note"}}', 9
+        assert '"tool": "file-write"' in query
+        assert '"saved": true' in query
+        return "agent", "Updated demo/note.md successfully.", 10
+
+    import app.api.routes.unified as unified
+
+    try:
+        created = client.post(
+            "/v1/agents/register",
+            json={
+                "agentId": agent_id,
+                "label": "DeepAgent File Loop",
+                "description": "DeepAgent runtime with file read/write loop.",
+                "systemPrompt": "Read the file before writing changes.",
+                "availableTools": ["file-read", "file-write"],
+                "runtime": {"mode": "agent", "engine": "deepagent", "maxToolCalls": 4},
+            },
+        )
+        assert created.status_code == 200
+
+        published = client.post(f"/v1/agents/{agent_id}/publish")
+        assert published.status_code == 200
+
+        with patch.object(
+            unified.deepagent_runtime_adapter._tool_adapter,
+            "execute",
+            side_effect=fake_tool_execute,
+        ), patch("app.runtime.deepagent_adapter.run_orchestrator", side_effect=fake_run_orchestrator):
+            resp = client.post(
+                f"/v1/agents/{agent_id}/invoke",
+                json={"input": {"message": "Read demo/note.md and polish it."}},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["result"]["answer"] == "Updated demo/note.md successfully."
+        assert [item["toolId"] for item in body["events"] if item["type"] == "tool_call"] == ["file-read", "file-write"]
+        assert body["stepOutputs"]["tool_1"]["result"]["content"] == "draft note"
+        assert body["stepOutputs"]["tool_2"]["result"]["saved"] is True
+        assert tool_calls[0][0] == "file-read"
+        assert tool_calls[1][0] == "file-write"
+        assert len(prompts) == 3
+    finally:
+        if agent_path.exists():
+            agent_path.unlink()
+
+
 def test_unified_stream_merges_step_tool_inputs_into_tool_args():
     client = TestClient(app)
 
@@ -728,3 +874,168 @@ def test_unified_stream_merges_step_tool_inputs_into_tool_args():
     text = resp.text
     assert '"toolId": "weather"' in text
     assert '"location": "Shanghai"' in text
+
+
+def test_unified_stream_emits_deepagent_tool_events_for_custom_agent():
+    client = TestClient(app)
+    agent_id = "deepagent-stream-agent"
+    agent_path = Path("data/registry/agents/deepagent-stream-agent.json")
+
+    class FakeResult:
+        status = "success"
+        mode = "agent"
+        answer = "Updated file successfully."
+        latency_ms = 12
+        error = None
+        step_outputs = {
+            "tool_1": {"toolId": "file-read", "result": {"content": "draft"}},
+            "tool_2": {"toolId": "file-write", "result": {"saved": True}},
+        }
+        events = [
+            {"type": "tool_call", "id": "tool_1", "toolId": "file-read", "args": {"path": "demo/note.md"}},
+            {"type": "tool_result", "id": "tool_1", "toolId": "file-read", "result": {"content": "draft"}},
+            {"type": "tool_call", "id": "tool_2", "toolId": "file-write", "args": {"path": "demo/note.md", "content": "polished"}},
+            {"type": "tool_result", "id": "tool_2", "toolId": "file-write", "result": {"saved": True}},
+        ]
+
+    async def fake_invoke(agent_spec, request, context):
+        assert agent_spec["id"] == agent_id
+        assert context.allowed_tool_ids == ["file-read", "file-write"]
+        return FakeResult()
+
+    try:
+        created = client.post(
+            "/v1/agents/register",
+            json={
+                "agentId": agent_id,
+                "label": "DeepAgent Stream Agent",
+                "description": "Streams tool events through unified execute stream.",
+                "systemPrompt": "Use file tools.",
+                "availableTools": ["file-read", "file-write"],
+                "runtime": {"mode": "agent", "engine": "deepagent", "maxToolCalls": 4},
+            },
+        )
+        assert created.status_code == 200
+
+        published = client.post(f"/v1/agents/{agent_id}/publish")
+        assert published.status_code == 200
+
+        with patch("app.api.routes.unified.deepagent_runtime_adapter.invoke", side_effect=fake_invoke):
+            resp = client.post(
+                "/v1/unified/execute/stream",
+                json={
+                    "requestId": "req-stream-deepagent-1",
+                    "tenantId": "tenant-a",
+                    "requestType": "chat",
+                    "messages": [{"role": "user", "content": "Read and update the note file."}],
+                    "inputs": {
+                        "confirmed": True,
+                        "executionPlan": {
+                            "planId": "plan-deepagent-stream-1",
+                            "mode": "agent",
+                            "steps": [
+                                {
+                                    "id": "s1",
+                                    "type": "llm",
+                                    "action": "Read and update the note file.",
+                                    "dependsOn": [],
+                                    "agent": agent_id,
+                                }
+                            ],
+                        },
+                    },
+                },
+            )
+
+        assert resp.status_code == 200
+        text = resp.text
+        assert '"type": "run_started"' in text
+        assert '"type": "step_started"' in text
+        assert '"stepName": "Read and update the note file."' in text
+        assert '"type": "tool_call"' in text
+        assert '"toolId": "file-read"' in text
+        assert '"type": "tool_result"' in text
+        assert '"toolId": "file-write"' in text
+        assert '"type": "step_completed"' in text
+        assert '"type": "run_completed"' in text
+        assert '"type": "done"' in text
+        assert 'Updated file successfully.' in text
+    finally:
+        if agent_path.exists():
+            agent_path.unlink()
+
+
+def test_trace_store_redacts_llm_api_key_from_trace_events():
+    client = TestClient(app)
+    request_id = "req-redact-api-key"
+    secret = "sk-secret-1234567890"
+    resp = client.post(
+        "/v1/unified/execute/stream",
+        json={
+            "requestId": request_id,
+            "tenantId": "tenant-a",
+            "requestType": "chat",
+            "messages": [{"role": "user", "content": "查询广州天气"}],
+            "inputs": {
+                "confirmed": True,
+                "executionPlan": {
+                    "planId": "plan-redact-api-key",
+                    "mode": "agent",
+                    "steps": [
+                        {
+                            "id": "s1",
+                            "type": "llm",
+                            "action": "理解用户问题意图并提取核心约束。",
+                            "dependsOn": [],
+                            "agent": "agent",
+                        }
+                    ],
+                },
+                "llmConfig": {
+                    "provider": "deepseek",
+                    "apiKey": secret,
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "model": "deepseek-chat",
+                },
+            },
+        },
+    )
+    assert resp.status_code == 200
+
+    trace_ids_resp = client.get("/v1/traces", params={"requestId": request_id})
+    assert trace_ids_resp.status_code == 200
+    trace_ids = trace_ids_resp.json()["traceIds"]
+    assert trace_ids
+
+    trace_resp = client.get(f"/v1/traces/{trace_ids[0]}")
+    assert trace_resp.status_code == 200
+    serialized = json.dumps(trace_resp.json(), ensure_ascii=False)
+    assert secret not in serialized
+    assert "***" in serialized
+
+
+def test_agent_invoke_response_redacts_llm_api_key():
+    client = TestClient(app)
+
+    async def fake_run_orchestrator(query: str, strategy: str = "auto", llm_config=None):
+        return "agent", "safe answer", 9
+
+    with patch("app.api.routes.unified.run_orchestrator", side_effect=fake_run_orchestrator):
+        resp = client.post(
+            "/v1/agents/agent/invoke",
+            json={
+                "prompt": "Hello",
+                "llmConfig": {
+                    "provider": "deepseek",
+                    "apiKey": "sk-very-secret-123456",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "model": "deepseek-chat",
+                },
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    request_payload = body["request"]
+    assert request_payload["llmConfig"]["apiKey"] != "sk-very-secret-123456"
+    assert "***" in request_payload["llmConfig"]["apiKey"]

@@ -4,7 +4,9 @@ import { useState } from "react";
 import {
   Background,
   Controls,
+  Handle,
   MiniMap,
+  Position,
   ReactFlow,
   type Edge,
   type Node,
@@ -29,6 +31,8 @@ function SkillNode({ data }: NodeProps<Node<SkillNodeData>>) {
   const [value, setValue] = useState("");
   return (
     <div className="min-w-[220px] rounded border border-zinc-400 bg-zinc-100 p-2 text-xs text-zinc-900 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100">
+      <Handle type="target" position={Position.Top} />
+      <Handle type="source" position={Position.Bottom} />
       <div className="font-medium mb-1">Skills Node</div>
       <div className="space-y-1 mb-2">
         {data.skills.length > 0 ? (

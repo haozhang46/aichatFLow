@@ -121,9 +121,7 @@ class CapabilityService:
     def recommend(self, query: str, mode: str) -> dict:
         q = query.lower()
         recommended: list[str] = []
-        if any(k in q for k in ["skill", "agent", "配置", "安装", "install"]):
-            recommended.append("find-skills")
-        if any(k in q for k in ["天气", "weather", "search", "查"]):
+        if any(k in q for k in ["skill", "skills", "agent", "agents", "capability", "capabilities", "插件", "能力", "配置", "安装", "install"]):
             recommended.append("find-skills")
         if mode == "workflow":
             recommended.append("skill-installer")

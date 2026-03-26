@@ -1,4 +1,18 @@
-export type Strategy = "auto" | "agent" | "react" | "workflow";
+export type { ExecutionMode, Strategy } from "@/lib/app-enums";
+export type { DeepSeekConfig } from "@/app/types/shared";
+import type { ExecutionMode, Strategy } from "@/lib/app-enums";
+
+export type ExecutionChecklistItem = {
+  id: string;
+  text: string;
+  done: boolean;
+};
+
+export type StepExecutionConfig = {
+  agent: string;
+  skills: string[];
+  tools: string[];
+};
 
 export type PlanBranchNode = {
   id: string;
@@ -34,6 +48,26 @@ export type ExecutionPlan = {
   steps: ExecutionPlanStep[];
 };
 
+export type PendingPlan = {
+  requestId: string;
+  query: string;
+  mode: Strategy;
+  reusedFromPlanRecord?: boolean;
+  planRecordPath?: string;
+  intentDescription: string;
+  thinking: string;
+  searchEvidence: Array<{ title: string; url: string }>;
+  lines: string[];
+  recommendedSkills: string[];
+  missingSkills: string[];
+  installRequired: boolean;
+  requiredSkills: string[];
+  taskChecklist: ExecutionChecklistItem[];
+  executionMode: ExecutionMode;
+  clawhubSuggestions?: ClawhubPlanSuggestion[];
+  executionPlan?: ExecutionPlan;
+};
+
 export type PlanHistoryItem = {
   id: string;
   query: string;
@@ -46,11 +80,11 @@ export type PlanHistoryItem = {
   favorite: boolean;
   createdAt: string;
   savedPath?: string;
-  taskChecklist?: Array<{ id: string; text: string; done: boolean }>;
-  executionMode?: "auto_exec" | "user_exec";
+  taskChecklist?: ExecutionChecklistItem[];
+  executionMode?: ExecutionMode;
   planBranches?: Record<number, PlanBranchNode[]>;
   selectedPlanBranch?: Record<number, Record<string, string>>;
-  stepExecutionConfigs?: Record<number, { agent: string; skills: string[]; tools?: string[] }>;
+  stepExecutionConfigs?: Record<number, StepExecutionConfig>;
   clawhubSuggestions?: ClawhubPlanSuggestion[];
   executionPlan?: ExecutionPlan;
   lastTraceId?: string;
@@ -128,15 +162,24 @@ export type CapabilityTool = {
   } | null;
 };
 
-export type DeepSeekConfig = {
-  enabled: boolean;
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-};
-
 export type RagConfig = {
   enabled: boolean;
   scope: string;
   topK: number;
+};
+
+export type RagDocument = {
+  documentId: string;
+  scope: string;
+  title: string;
+  source?: string;
+  tags?: string[];
+  content?: string;
+  chunks?: Array<{ chunkId: string; chunkIndex: number; content: string }>;
+  updatedAt?: string;
+};
+
+export type RagGraph = {
+  nodes: Array<{ id: string; type: string; label: string; meta: Record<string, unknown> }>;
+  edges: Array<{ id: string; source: string; target: string }>;
 };

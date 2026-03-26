@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 from datetime import datetime
 import json
+import re
 import time
 from typing import Any, Optional
 
@@ -43,6 +44,7 @@ from app.core.config import settings
 from app.runtime.deepagent_adapter import DeepAgentInvokeContext, DeepAgentInvokeRequest
 from app.services.clawhub_service import search_skills as clawhub_search_skills
 from app.services.clawhub_plan_analysis import build_clawhub_plan_suggestions
+from app.services.trace_store import sanitize_sensitive_data
 
 router = APIRouter()
 
@@ -278,6 +280,86 @@ def _agent_runtime_engine(record: dict[str, Any] | None) -> str:
     return engine if engine in {"otie", "deepagent"} else "otie"
 
 
+def _safe_llm_config_for_response(raw: Any) -> Any:
+    return sanitize_sensitive_data(raw)
+
+
+def _get_registered_deepagent_record(agent_id: str) -> dict[str, Any] | None:
+    record = agent_registry_service.get_agent_record(agent_id)
+    if record is None:
+        return None
+    return record if _agent_runtime_engine(record) == "deepagent" else None
+
+
+def _sse_event(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _plan_step_names(plan: ExecutionPlan) -> dict[str, str]:
+    return {step.id: step.action for step in plan.steps}
+
+
+def _frontend_event_from_trace(
+    event: dict[str, Any],
+    *,
+    run_id: str,
+    step_names: dict[str, str],
+    step_outputs: dict[str, Any],
+) -> dict[str, Any] | None:
+    event_type = str(event.get("type") or "").strip()
+    step_id = str(event.get("stepId") or "").strip()
+    step_name = step_names.get(step_id) or str(event.get("action") or "").strip()
+
+    if event_type == "step_started":
+        return {
+            "type": "step_started",
+            "runId": run_id,
+            "stepId": step_id,
+            "stepName": step_name,
+            "kind": event.get("kind"),
+        }
+
+    if event_type == "tool_call":
+        return {
+            "type": "tool_call",
+            "runId": run_id,
+            "stepId": step_id,
+            "stepName": step_name,
+            "toolId": event.get("toolId"),
+            "args": event.get("args") or {},
+        }
+
+    if event_type == "tool_result":
+        return {
+            "type": "tool_result",
+            "runId": run_id,
+            "stepId": step_id,
+            "stepName": step_name,
+            "toolId": event.get("toolId"),
+            "result": event.get("result"),
+        }
+
+    if event_type == "step_completed":
+        return {
+            "type": "step_completed",
+            "runId": run_id,
+            "stepId": step_id,
+            "stepName": step_name,
+            "status": event.get("status") or "success",
+            "output": step_outputs.get(step_id),
+        }
+
+    if event_type == "run_finished":
+        return {
+            "type": "run_completed",
+            "runId": run_id,
+            "status": event.get("status"),
+            "finalAnswer": event.get("finalAnswer"),
+        }
+
+    return None
+
+
 def _build_otie_plan_from_steps(
     *,
     request_id: str,
@@ -368,6 +450,99 @@ def _build_otie_plan_from_steps(
     )
 
 
+def _extract_weather_location(query: str) -> str:
+    q = str(query or "").strip()
+    lowered = q.lower()
+    weather_keywords = ["weather", "forecast", "temperature", "天气", "气温", "温度", "预报"]
+    if not any(keyword in lowered for keyword in weather_keywords):
+        return ""
+
+    english_match = re.search(r"(?:weather|forecast|temperature)\s+(?:in|for)\s+([a-zA-Z\s,.-]+)", q, re.IGNORECASE)
+    if english_match:
+        return _normalize_weather_location(english_match.group(1))
+
+    chinese_match = re.search(r"(?:查询|查|看看|看下)?(.+?)(?:今天|今日|明天|天气|气温|温度|预报)", q)
+    if chinese_match:
+        candidate = _normalize_weather_location(chinese_match.group(1))
+        if candidate:
+            return candidate
+
+    return _normalize_weather_location(q)
+
+
+def _normalize_weather_location(value: str) -> str:
+    text = value.strip(" 在的，,。.?!")
+    text = re.sub(r"\b(today|tomorrow|now|right now|this week)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(今天|今日|明天|现在|当前|这周)$", "", text)
+    return text.strip(" ,.-")
+
+
+def _steps_include_tool(steps: list[dict[str, Any]], tool_id: str) -> bool:
+    target = str(tool_id).strip()
+    if not target:
+        return False
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        step_type = str(step.get("type") or "").strip().lower()
+        if step_type == "tool" and str(step.get("toolId") or "").strip() == target:
+            return True
+        if target in {str(item).strip() for item in (step.get("tools") or []) if str(item).strip()}:
+            return True
+    return False
+
+
+def _augment_steps_for_query(query: str, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_steps: list[dict[str, Any]] = []
+    q = str(query or "").lower()
+    keep_find_skills = any(
+        token in q
+        for token in ["skill", "skills", "agent", "agents", "capability", "capabilities", "插件", "能力", "安装", "install"]
+    )
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        updated = {**step}
+        skills = [str(item).strip() for item in (updated.get("skills") or []) if str(item).strip()]
+        tools = [str(item).strip() for item in (updated.get("tools") or []) if str(item).strip()]
+        if not keep_find_skills:
+            skills = [item for item in skills if item != "find-skills"]
+            tools = [item for item in tools if item != "find-skills"]
+        updated["skills"] = skills
+        updated["tools"] = tools
+        normalized_steps.append(updated)
+
+    weather_location = _extract_weather_location(query)
+    if not weather_location or _steps_include_tool(normalized_steps, "weather"):
+        return normalized_steps
+
+    weather_step_id = "auto_weather_1"
+    inserted: list[dict[str, Any]] = [
+        {
+            "id": weather_step_id,
+            "type": "tool",
+            "action": f"Fetch current weather for `{weather_location}`.",
+            "dependsOn": [],
+            "agent": "auto",
+            "tools": [],
+            "toolInputs": {},
+            "input": {"location": weather_location, "query": query},
+            "toolId": "weather",
+        }
+    ]
+
+    for idx, step in enumerate(normalized_steps):
+        updated = {**step}
+        depends_on = updated.get("dependsOn")
+        if not isinstance(depends_on, list):
+            depends_on = []
+        if idx == 0 and weather_step_id not in depends_on:
+            depends_on = [weather_step_id, *[str(item) for item in depends_on if str(item).strip()]]
+        updated["dependsOn"] = depends_on
+        inserted.append(updated)
+    return inserted
+
+
 async def _resolve_otie_plan_for_payload(
     payload: UnifiedRequest,
     *,
@@ -400,6 +575,7 @@ async def _resolve_otie_plan_for_payload(
             default_mode=default_mode,
             step_overrides=step_overrides if isinstance(step_overrides, dict) else None,
         )
+        steps = _augment_steps_for_query(query, steps)
         plan = _build_otie_plan_from_steps(
             request_id=payload.request_id,
             intent_id=intent.intent_id,
@@ -861,7 +1037,7 @@ async def invoke_agent(agent_id: str, payload: AgentInvokeIn, request: Request) 
                 "context": request_context,
                 "runtimeOptions": runtime_options,
                 "strategy": strategy,
-                "llmConfig": payload.llm_config,
+                "llmConfig": _safe_llm_config_for_response(payload.llm_config),
                 "availableTools": effective_available_tools,
                 "runtimeEngine": runtime_engine,
             },
@@ -884,7 +1060,7 @@ async def invoke_agent(agent_id: str, payload: AgentInvokeIn, request: Request) 
                     "context": request_context,
                     "runtimeOptions": runtime_options,
                     "strategy": strategy,
-                    "llmConfig": payload.llm_config,
+                    "llmConfig": _safe_llm_config_for_response(payload.llm_config),
                     "availableTools": effective_available_tools,
                     "runtimeEngine": runtime_engine,
                 },
@@ -914,7 +1090,7 @@ async def invoke_agent(agent_id: str, payload: AgentInvokeIn, request: Request) 
             "context": request_context,
             "runtimeOptions": runtime_options,
             "strategy": strategy,
-            "llmConfig": payload.llm_config,
+            "llmConfig": _safe_llm_config_for_response(payload.llm_config),
             "availableTools": effective_available_tools,
             "runtimeEngine": runtime_engine,
         },
@@ -1018,7 +1194,7 @@ async def set_personal_skill_path(payload: PersonalSkillPathIn) -> dict[str, Any
 
 
 @router.post("/v1/unified/execute/stream")
-async def execute_unified_stream(payload: UnifiedRequest):
+async def execute_unified_stream(payload: UnifiedRequest, request: Request):
     if payload.request_type != "chat":
         raise HTTPException(status_code=400, detail="stream execute only supports requestType=chat")
     confirmed = bool((payload.inputs or {}).get("confirmed"))
@@ -1092,9 +1268,17 @@ async def execute_unified_stream(payload: UnifiedRequest):
         default_mode=default_mode,
         step_overrides=step_overrides if isinstance(step_overrides, dict) else None,
     )
+    steps = _augment_steps_for_query(query, steps)
 
     otie_request = _build_otie_request(payload, query)
     intent = otie_intent_service.normalize(otie_request)
+
+    deepagent_record: dict[str, Any] | None = None
+    if len(steps) == 1:
+        step_agent_id = str(steps[0].get("agent") or "").strip()
+        if step_agent_id and step_agent_id not in {"agent", "react", "workflow", "auto"}:
+            deepagent_record = _get_registered_deepagent_record(step_agent_id)
+
     plan = (
         _build_otie_plan_from_steps(
             request_id=payload.request_id,
@@ -1107,42 +1291,121 @@ async def execute_unified_stream(payload: UnifiedRequest):
     )
 
     async def event_stream():
+        if deepagent_record is not None:
+            allowed_tool_ids = [
+                str(item).strip()
+                for item in (deepagent_record.get("availableTools") or [])
+                if str(item).strip()
+            ]
+            deep_trace_id = platform_trace_service.new_trace_id("deepstream")
+            deep_run_id = platform_trace_service.new_trace_id("deepstream-run")
+            deepagent_result = await deepagent_runtime_adapter.invoke(
+                deepagent_record,
+                request=DeepAgentInvokeRequest(
+                    input={"message": query},
+                    context=(payload.inputs or {}).get("context")
+                    if isinstance((payload.inputs or {}).get("context"), dict)
+                    else {},
+                    runtime_options={},
+                    llm_config=_get_llm_config(payload),
+                ),
+                context=DeepAgentInvokeContext(
+                    trace_id=deep_trace_id,
+                    run_id=deep_run_id,
+                    user_id=_current_user_id(request),
+                    agent_id=str(deepagent_record.get("id") or ""),
+                    tenant_id=payload.tenant_id,
+                    allowed_tool_ids=allowed_tool_ids,
+                ),
+            )
+            step_name = str(steps[0].get("action") or query).strip() if steps else query
+            step_id = str(steps[0].get("id") or "s1").strip() if steps else "s1"
+            yield _sse_event({"type": "trace", "traceId": deep_trace_id})
+            yield _sse_event({"type": "run_started", "runId": deep_run_id, "traceId": deep_trace_id})
+            yield _sse_event(
+                {
+                    "type": "step_started",
+                    "runId": deep_run_id,
+                    "stepId": step_id,
+                    "stepName": step_name,
+                    "kind": "agent",
+                }
+            )
+            for event in deepagent_result.events:
+                shaped = dict(event)
+                shaped.setdefault("runId", deep_run_id)
+                shaped.setdefault("stepId", step_id)
+                shaped.setdefault("stepName", step_name)
+                yield _sse_event(shaped)
+            yield _sse_event(
+                {
+                    "type": "step_completed",
+                    "runId": deep_run_id,
+                    "stepId": step_id,
+                    "stepName": step_name,
+                    "status": "success" if deepagent_result.status == "success" else deepagent_result.status,
+                    "output": deepagent_result.answer,
+                }
+            )
+            yield _sse_event(
+                {
+                    "type": "run_completed",
+                    "runId": deep_run_id,
+                    "status": deepagent_result.status,
+                    "finalAnswer": deepagent_result.answer,
+                }
+            )
+            yield _sse_event({'type': 'done', 'mode': deepagent_result.mode, 'answer': deepagent_result.answer, 'blocked': deepagent_result.status != 'success'})
+            yield _sse_event({'type': 'trace_summary', 'trace': {'total': len(deepagent_result.events), 'success': 1 if deepagent_result.status == 'success' else 0, 'failed': 0 if deepagent_result.status == 'success' else 1}, 'runId': deep_run_id})
+            return
+
         if isinstance(confirmed_skills, list):
             for skill_id in [str(x).strip() for x in confirmed_skills if str(x).strip()]:
-                yield f"data: {json.dumps({'type': 'skill_start', 'skill': skill_id}, ensure_ascii=False)}\n\n"
+                yield _sse_event({'type': 'skill_start', 'skill': skill_id})
                 result = skill_executor_service.execute(skill_id, query)
-                yield f"data: {json.dumps({'type': 'skill_result', **result}, ensure_ascii=False)}\n\n"
+                yield _sse_event({'type': 'skill_result', **result})
         if isinstance(missing_skills, list):
             install_events = capability_service.install_events_for_missing(
                 [str(x) for x in missing_skills if str(x).strip()],
                 auto_install=auto_install_missing,
             )
             for evt in install_events:
-                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                yield _sse_event(evt)
         result = await otie_runtime.run(
             intent,
             plan,
             step_approvals=step_approvals if isinstance(step_approvals, dict) else {},
         )
-        yield f"data: {json.dumps({'type': 'trace', 'traceId': result.trace_id}, ensure_ascii=False)}\n\n"
+        yield _sse_event({'type': 'trace', 'traceId': result.trace_id})
+        yield _sse_event({'type': 'run_started', 'runId': result.run_id, 'traceId': result.trace_id})
         success_count = 0
         failed_count = 0
+        step_names = _plan_step_names(plan)
         for event in result.events:
             event_type = str(event.get("type") or "")
             if event_type == "step_completed":
                 success_count += 1
             if event_type == "run_finished" and str(event.get("status")) in {"failed", "awaiting_approval"}:
                 failed_count += 1
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            shaped = _frontend_event_from_trace(
+                event,
+                run_id=result.run_id,
+                step_names=step_names,
+                step_outputs=result.step_outputs,
+            )
+            if shaped is not None:
+                yield _sse_event(shaped)
+            yield _sse_event(event)
         if result.status == "awaiting_approval":
             pending_step = ""
             for event in result.events:
                 if event.get("type") == "state_transition" and event.get("toState") == "awaiting_approval":
                     pending_step = str(event.get("stepId") or "")
                     break
-            yield f"data: {json.dumps({'type': 'approval_required', 'stepId': pending_step, 'decision': 'pending'}, ensure_ascii=False)}\n\n"
-        yield f"data: {json.dumps({'type': 'done', 'mode': plan.mode, 'answer': result.final_answer, 'blocked': result.status == 'awaiting_approval'}, ensure_ascii=False)}\n\n"
-        yield f"data: {json.dumps({'type': 'trace_summary', 'trace': {'total': len(plan.steps), 'success': success_count, 'failed': failed_count}, 'runId': result.run_id}, ensure_ascii=False)}\n\n"
+            yield _sse_event({'type': 'approval_required', 'stepId': pending_step, 'decision': 'pending'})
+        yield _sse_event({'type': 'run_completed', 'runId': result.run_id, 'status': result.status, 'finalAnswer': result.final_answer})
+        yield _sse_event({'type': 'done', 'mode': plan.mode, 'answer': result.final_answer, 'blocked': result.status == 'awaiting_approval'})
+        yield _sse_event({'type': 'trace_summary', 'trace': {'total': len(plan.steps), 'success': success_count, 'failed': failed_count}, 'runId': result.run_id})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

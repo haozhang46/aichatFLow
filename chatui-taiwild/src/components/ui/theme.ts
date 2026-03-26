@@ -9,26 +9,26 @@ export const buttonVariantClass = {
 } as const;
 
 export const ragGraphTheme = {
-  background: "#09090b",
-  glow: "#18181b",
+  background: "#f8fafc",
+  glow: "#dbeafe",
   node: {
-    scope: "#f4f4f5",
-    document: "#a1a1aa",
-    chunk: "#52525b",
+    scope: "#ff6b6b",
+    document: "#4ecdc4",
+    chunk: "#3b82f6",
   },
   edge: {
-    hierarchyScope: "rgba(244,244,245,0.28)",
-    hierarchyChunk: "rgba(161,161,170,0.18)",
-    tag: "rgba(212,212,216,0.22)",
-    source: "rgba(113,113,122,0.22)",
-    similar: "rgba(82,82,91,0.28)",
+    hierarchyScope: "rgba(59,130,246,0.22)",
+    hierarchyChunk: "rgba(148,163,184,0.48)",
+    tag: "rgba(78,205,196,0.4)",
+    source: "rgba(59,130,246,0.34)",
+    similar: "rgba(168,85,247,0.3)",
   },
   legend: {
-    scope: "bg-zinc-100",
-    document: "bg-zinc-400",
-    chunk: "bg-zinc-600",
-    tag: "bg-zinc-300",
-    source: "bg-zinc-500",
-    similar: "bg-zinc-700",
+    scope: "bg-[#ff6b6b]",
+    document: "bg-[#4ecdc4]",
+    chunk: "bg-[#3b82f6]",
+    tag: "bg-[#4ecdc4]",
+    source: "bg-[#3b82f6]",
+    similar: "bg-[#a855f7]",
   },
 } as const;

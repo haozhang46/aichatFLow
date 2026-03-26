@@ -106,7 +106,15 @@ class DeepAgentRuntimeAdapter:
             metadata={"action": "deepagent_reason_and_respond", "strategy": strategy},
         )
         try:
-            mode, answer, _ = await run_orchestrator(prompt, strategy=strategy, llm_config=request.llm_config)
+            mode, answer = await self._run_agent_loop(
+                agent_spec=agent_spec,
+                request=request,
+                context=context,
+                base_prompt=prompt,
+                strategy=strategy,
+                step_outputs=step_outputs,
+                events=events,
+            )
         except Exception as exc:
             self._trace_adapter.emit_run_completed(
                 trace_id=context.trace_id,
@@ -161,6 +169,79 @@ class DeepAgentRuntimeAdapter:
             error=None,
         )
 
+    async def _run_agent_loop(
+        self,
+        *,
+        agent_spec: dict[str, Any],
+        request: DeepAgentInvokeRequest,
+        context: DeepAgentInvokeContext,
+        base_prompt: str,
+        strategy: str,
+        step_outputs: dict[str, Any],
+        events: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        runtime = agent_spec.get("runtime") if isinstance(agent_spec.get("runtime"), dict) else {}
+        max_tool_calls = int(runtime.get("maxToolCalls") or runtime.get("maxSteps") or 4)
+        max_tool_calls = max(1, min(max_tool_calls, 12))
+        tool_results: list[dict[str, Any]] = []
+
+        for tool_index in range(max_tool_calls + 1):
+            prompt = self._compose_loop_prompt(base_prompt, tool_results)
+            mode, answer, _ = await run_orchestrator(prompt, strategy=strategy, llm_config=request.llm_config)
+            tool_call = self._extract_tool_call(answer)
+            if tool_call is None:
+                return mode, answer
+
+            if tool_index >= max_tool_calls:
+                raise RuntimeError(f"DeepAgent exceeded maxToolCalls={max_tool_calls}")
+
+            tool_id = str(tool_call.get("tool") or tool_call.get("toolId") or "").strip()
+            args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+            if not tool_id:
+                raise ValueError("tool call is missing `tool`")
+
+            event_id = f"tool_{tool_index + 1}"
+            tool_call_event = {
+                "type": "tool_call",
+                "id": event_id,
+                "toolId": tool_id,
+                "args": args,
+            }
+            events.append(tool_call_event)
+            step_outputs[event_id] = {"toolId": tool_id, "args": args}
+
+            result = await self._safe_tool_execute(
+                tool_id,
+                args,
+                context=context,
+                parent_span_id="deepagent_main",
+            )
+            if result is None:
+                raise RuntimeError(f"tool `{tool_id}` execution failed")
+
+            tool_result_event = {
+                "type": "tool_result",
+                "id": event_id,
+                "toolId": tool_id,
+                "result": result,
+            }
+            events.append(tool_result_event)
+            step_outputs[event_id] = {
+                "toolId": tool_id,
+                "args": args,
+                "result": result,
+            }
+            tool_results.append(
+                {
+                    "id": event_id,
+                    "toolId": tool_id,
+                    "args": args,
+                    "result": result,
+                }
+            )
+
+        raise RuntimeError("DeepAgent loop terminated unexpectedly")
+
     def _compose_prompt(
         self,
         agent_name: str,
@@ -186,6 +267,69 @@ class DeepAgentRuntimeAdapter:
             prompt += f"Retrieved knowledge:\n{rag_context}\n\n"
         prompt += f"User request:\n{user_message}"
         return prompt
+
+    def _compose_loop_prompt(self, base_prompt: str, tool_results: list[dict[str, Any]]) -> str:
+        instructions = (
+            "\n\nTool-use protocol:\n"
+            "- If you need a tool, return ONLY JSON in this shape:\n"
+            '{"type":"tool_call","tool":"<tool-id>","args":{}}\n'
+            "- If you already have enough information, return the final natural-language answer directly.\n"
+            "- When tool results are provided below, use them instead of asking for the same tool again.\n"
+        )
+        if not tool_results:
+            return base_prompt + instructions
+
+        rendered_results: list[str] = []
+        for item in tool_results:
+            rendered_results.append(
+                json.dumps(
+                    {
+                        "id": item.get("id"),
+                        "tool": item.get("toolId"),
+                        "args": item.get("args"),
+                        "result": item.get("result"),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return base_prompt + instructions + "\nTool results:\n" + "\n".join(rendered_results)
+
+    def _extract_tool_call(self, answer: str) -> dict[str, Any] | None:
+        text = str(answer or "").strip()
+        if not text:
+            return None
+        payload = self._extract_json_payload(text)
+        if not isinstance(payload, dict):
+            return None
+        payload_type = str(payload.get("type") or "").strip().lower()
+        if payload_type != "tool_call":
+            return None
+        return payload
+
+    def _extract_json_payload(self, text: str) -> dict[str, Any] | None:
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            lines = candidate.splitlines()
+            if lines:
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            candidate = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
 
     async def _hydrate_memory(
         self,

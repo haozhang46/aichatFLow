@@ -16,6 +16,43 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_SENSITIVE_KEYS = {
+    "apikey",
+    "api_key",
+    "authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+    "secret",
+    "password",
+}
+
+
+def _redact_string(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return value
+    if len(text) <= 8:
+        return "***REDACTED***"
+    return f"{text[:4]}***{text[-4:]}"
+
+
+def sanitize_sensitive_data(value: Any, parent_key: str | None = None) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).strip()
+            sanitized[normalized_key] = sanitize_sensitive_data(item, normalized_key)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitize_sensitive_data(item, parent_key) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_sensitive_data(item, parent_key) for item in value]
+    if parent_key and parent_key.strip().lower() in _SENSITIVE_KEYS:
+        return _redact_string(str(value))
+    return value
+
+
 class TraceBackend(Protocol):
     def append(self, trace_id: str, event: dict[str, Any]) -> None:
         ...
@@ -121,7 +158,7 @@ class TraceStore:
         self._backend = self._build_backend(base_dir=base_dir)
 
     def append(self, trace_id: str, event: dict[str, Any]) -> None:
-        self._backend.append(trace_id, event)
+        self._backend.append(trace_id, sanitize_sensitive_data(event))
 
     def read_trace(self, trace_id: str) -> list[dict[str, Any]]:
         return self._backend.read_trace(trace_id)

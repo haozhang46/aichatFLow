@@ -3,6 +3,7 @@
 import AppButton from "@/components/ui/AppButton";
 import AppModal from "@/components/ui/AppModal";
 import type { RagConfig, Strategy } from "@/app/components/modalTypes";
+import { API_BASE_URL } from "@/lib/api-client";
 
 type Props = {
   open: boolean;
@@ -13,7 +14,6 @@ type Props = {
   setStrategy: (value: Strategy) => void;
   ragConfig: RagConfig;
   setRagConfig: (updater: (prev: RagConfig) => RagConfig) => void;
-  apiBaseUrl: string;
 };
 
 export default function SettingsModal(props: Props) {
@@ -91,7 +91,7 @@ export default function SettingsModal(props: Props) {
       </div>
 
       <div className="rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-950 px-3 py-2 text-xs text-zinc-500">
-        API: <span className="font-mono">{props.apiBaseUrl}</span>
+        API: <span className="font-mono">{API_BASE_URL}</span>
       </div>
     </AppModal>
   );

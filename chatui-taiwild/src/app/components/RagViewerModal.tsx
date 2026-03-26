@@ -1,9 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { forceLink, forceManyBody, forceSimulation, forceX, forceY } from "d3";
+import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY } from "d3";
 import * as yup from "yup";
-import { Background, Controls, ReactFlow, type Edge, type Node } from "@xyflow/react";
+import {
+  Background,
+  BaseEdge,
+  Controls,
+  Handle,
+  MiniMap,
+  Position,
+  ReactFlow,
+  getBezierPath,
+  type Edge,
+  type EdgeProps,
+  type Node,
+  type NodeProps,
+  type NodeTypes,
+} from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import AppButton from "@/components/ui/AppButton";
 import BaseForm, { BaseField, BaseSelect, BaseTextarea } from "@/components/ui/BaseForm";
@@ -31,6 +45,8 @@ type ForceGraphNodeData = {
   color: string;
   val: number;
   opacity: number;
+  ring: number;
+  inner: number;
   x?: number;
   y?: number;
   fx?: number | null;
@@ -64,6 +80,16 @@ type DocumentFormValues = {
   source: string;
   tags: string;
   content: string;
+};
+
+type FlowEditorNodeData = {
+  label: string;
+  meta: Record<string, unknown>;
+  kind: "scope" | "document" | "chunk";
+  accent: string;
+  chipLabel: string;
+  summary: string;
+  stats: string[];
 };
 
 type Props = {
@@ -158,9 +184,31 @@ function pickNodeColor(type: string) {
 }
 
 function pickNodeSize(type: string) {
-  if (type === "scope") return 11;
-  if (type === "document") return 8;
-  return 4.5;
+  if (type === "scope") return 18;
+  if (type === "document") return 12;
+  return 8;
+}
+
+function pickNodeRingSize(type: string) {
+  if (type === "scope") return 22;
+  if (type === "document") return 14;
+  return 9.5;
+}
+
+function pickNodeInnerSize(type: string) {
+  if (type === "scope") return 8;
+  if (type === "document") return 4.8;
+  return 3.4;
+}
+
+function pickNodeTypeLabel(type: string) {
+  if (type === "scope") return "Scope";
+  if (type === "document") return "Document";
+  return "Chunk";
+}
+
+function truncateLabel(value: string, max = 30) {
+  return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
 function normalizeTagList(tags: unknown) {
@@ -205,61 +253,152 @@ function buildGraphMaps(graph: NonNullable<Props["graph"]>) {
   return { scopeNodes, docNodes, docByScope, chunkByDoc };
 }
 
-function buildTreeFlowGraph(graph: Props["graph"]): { nodes: Node[]; edges: Edge[] } {
+function buildFlowSummary(kind: FlowEditorNodeData["kind"], meta: Record<string, unknown>) {
+  if (kind === "scope") {
+    return `Scope workspace · ${String(meta.scope ?? "").trim() || "unscoped"}`;
+  }
+  if (kind === "document") {
+    const source = String(meta.source ?? "").trim();
+    return source || "Document knowledge item";
+  }
+  const documentId = String(meta.documentId ?? "").trim();
+  return documentId ? `Chunk of ${documentId}` : "Chunk segment";
+}
+
+function buildFlowStats(kind: FlowEditorNodeData["kind"], meta: Record<string, unknown>) {
+  if (kind === "scope") {
+    const scope = String(meta.scope ?? "").trim();
+    return [scope || "default", "entry"];
+  }
+  if (kind === "document") {
+    const tags = Array.isArray(meta.tags) ? meta.tags.length : 0;
+    const updatedAt = String(meta.updatedAt ?? "").trim();
+    return [`${tags} tag${tags === 1 ? "" : "s"}`, updatedAt ? "tracked" : "draft"];
+  }
+  const chunkIndex = meta.chunkIndex;
+  return [typeof chunkIndex === "number" ? `chunk ${chunkIndex + 1}` : "chunk", "segment"];
+}
+
+function FlowEditorNode({ data, selected }: NodeProps<Node<FlowEditorNodeData>>) {
+  return (
+    <div
+      className="min-w-[250px] max-w-[280px] rounded-2xl border bg-white shadow-[0_22px_55px_-30px_rgba(15,23,42,0.45)]"
+      style={{
+        borderColor: selected ? data.accent : "rgba(148,163,184,0.28)",
+        boxShadow: selected
+          ? `0 24px 60px -30px ${data.accent}55`
+          : "0 20px 48px -34px rgba(15,23,42,0.38)",
+      }}
+    >
+      <Handle type="target" position={Position.Left} className="!h-3 !w-3 !border-2 !border-white" style={{ background: data.accent }} />
+      <div className="rounded-t-2xl px-4 py-3 text-white" style={{ background: `linear-gradient(135deg, ${data.accent}, ${data.accent}cc)` }}>
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/80">{data.chipLabel}</div>
+            <div className="mt-1 truncate text-sm font-semibold">{data.label}</div>
+          </div>
+          <div className="rounded-full border border-white/25 bg-white/14 px-2 py-1 text-[10px] font-medium">{data.kind}</div>
+        </div>
+      </div>
+      <div className="px-4 py-3">
+        <div className="text-[11px] leading-5 text-slate-500">{data.summary}</div>
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {data.stats.map((item) => (
+            <span key={item} className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-medium text-slate-600">
+              {item}
+            </span>
+          ))}
+        </div>
+      </div>
+      <Handle type="source" position={Position.Right} className="!h-3 !w-3 !border-2 !border-white" style={{ background: data.accent }} />
+    </div>
+  );
+}
+
+function FlowEditorEdge(props: EdgeProps<Edge>) {
+  const [path] = getBezierPath({
+    sourceX: props.sourceX,
+    sourceY: props.sourceY,
+    sourcePosition: props.sourcePosition,
+    targetX: props.targetX,
+    targetY: props.targetY,
+    targetPosition: props.targetPosition,
+  });
+
+  return <BaseEdge path={path} style={{ stroke: "#94a3b8", strokeWidth: 1.35, strokeOpacity: 0.82 }} />;
+}
+
+const flowNodeTypes: NodeTypes = {
+  flowEditorNode: FlowEditorNode,
+};
+
+function buildTreeFlowGraph(graph: Props["graph"]): { nodes: Node<FlowEditorNodeData>[]; edges: Edge[] } {
   if (!graph) return { nodes: [], edges: [] };
   const { scopeNodes, docByScope, chunkByDoc } = buildGraphMaps(graph);
 
-  const nodes: Node[] = [];
+  const nodes: Node<FlowEditorNodeData>[] = [];
   const edges: Edge[] = graph.edges.map((edge) => ({
     id: edge.id,
     source: edge.source,
     target: edge.target,
     animated: false,
-    style: { stroke: "#a1a1aa" },
+    type: "flowEditorEdge",
+    style: { stroke: "#94a3b8", strokeWidth: 1.35 },
   }));
 
   scopeNodes.forEach((scopeNode, scopeIndex) => {
+    const docs = docByScope.get(scopeNode.id) ?? [];
     nodes.push({
       id: scopeNode.id,
-      position: { x: 20, y: 40 + scopeIndex * 220 },
-      data: { label: scopeNode.label, meta: scopeNode.meta },
-      type: "default",
-      style: {
-        width: 160,
-        border: "1px solid #d4d4d8",
-        background: "#fafafa",
-        color: "#18181b",
+      position: { x: 40, y: 80 + scopeIndex * 300 },
+      data: {
+        label: scopeNode.label,
+        meta: scopeNode.meta,
+        kind: "scope",
+        accent: "#ff6b6b",
+        chipLabel: "Scope Node",
+        summary: buildFlowSummary("scope", scopeNode.meta),
+        stats: [...buildFlowStats("scope", scopeNode.meta), `${docs.length} docs`],
       },
+      type: "flowEditorNode",
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
     });
-    const docs = docByScope.get(scopeNode.id) ?? [];
     docs.forEach((docNode, docIndex) => {
-      const y = 20 + scopeIndex * 220 + docIndex * 90;
+      const y = 40 + scopeIndex * 300 + docIndex * 160;
+      const chunks = chunkByDoc.get(docNode.id) ?? [];
       nodes.push({
         id: docNode.id,
-        position: { x: 250, y },
-        data: { label: docNode.label, meta: docNode.meta },
-        type: "default",
-        style: {
-          width: 220,
-          border: "1px solid #a1a1aa",
-          background: "#f4f4f5",
-          color: "#27272a",
+        position: { x: 360, y },
+        data: {
+          label: docNode.label,
+          meta: docNode.meta,
+          kind: "document",
+          accent: "#4ecdc4",
+          chipLabel: "Document Node",
+          summary: buildFlowSummary("document", docNode.meta),
+          stats: [...buildFlowStats("document", docNode.meta), `${chunks.length} chunks`],
         },
+        type: "flowEditorNode",
+        sourcePosition: Position.Right,
+        targetPosition: Position.Left,
       });
-      const chunks = chunkByDoc.get(docNode.id) ?? [];
       chunks.forEach((chunkNode, chunkIndex) => {
         nodes.push({
           id: chunkNode.id,
-          position: { x: 540, y: y + chunkIndex * 74 },
-          data: { label: chunkNode.label, meta: chunkNode.meta },
-          type: "default",
-          style: {
-            width: 260,
-            border: "1px solid #a3a3a3",
-            background: "#fafafa",
-            color: "#27272a",
-            fontSize: 11,
+          position: { x: 720, y: y + chunkIndex * 124 },
+          data: {
+            label: chunkNode.label,
+            meta: chunkNode.meta,
+            kind: "chunk",
+            accent: "#3b82f6",
+            chipLabel: "Chunk Node",
+            summary: buildFlowSummary("chunk", chunkNode.meta),
+            stats: buildFlowStats("chunk", chunkNode.meta),
           },
+          type: "flowEditorNode",
+          sourcePosition: Position.Right,
+          targetPosition: Position.Left,
         });
       });
     });
@@ -373,6 +512,8 @@ function buildForceGraphData(
     meta: node.meta,
     color: pickNodeColor(node.type),
     val: pickNodeSize(node.type),
+    ring: pickNodeRingSize(node.type),
+    inner: pickNodeInnerSize(node.type),
     opacity: selectedGraphNodeId && !neighborIds.has(node.id) ? 0.18 : 1,
   }));
 
@@ -415,6 +556,7 @@ export default function RagViewerModal(props: Props) {
   const [selectedDocumentDraft, setSelectedDocumentDraft] = useState<DocumentFormValues | null>(null);
   const [deletingDocument, setDeletingDocument] = useState(false);
   const [deletingDocumentId, setDeletingDocumentId] = useState<string | null>(null);
+  const [forceStrength, setForceStrength] = useState(170);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const graphViewportRef = useRef<HTMLDivElement | null>(null);
   const [graphViewport, setGraphViewport] = useState({ width: 0, height: 0 });
@@ -466,12 +608,20 @@ export default function RagViewerModal(props: Props) {
         forceLink<ForceGraphNodeData, ForceGraphLinkData>(links)
           .id((node: ForceGraphNodeData) => node.id)
           .distance((link: ForceGraphLinkData) => {
-            if (link.relationType === "hierarchy") return String(link.target).startsWith("chunk:") ? 70 : 110;
-            if (link.relationType === "similar") return 140;
-            return 120;
+            if (link.relationType === "hierarchy") return String(link.target).startsWith("chunk:") ? 78 : 124;
+            if (link.relationType === "similar") return 150;
+            return 132;
           })
       )
-      .force("charge", forceManyBody<ForceGraphNodeData>().strength((node: ForceGraphNodeData) => (node.type === "chunk" ? -35 : -170)))
+      .force(
+        "charge",
+        forceManyBody<ForceGraphNodeData>().strength((node: ForceGraphNodeData) => {
+          if (node.type === "chunk") return -Math.max(45, forceStrength * 0.42);
+          if (node.type === "scope") return -forceStrength * 1.45;
+          return -forceStrength;
+        })
+      )
+      .force("collision", forceCollide<ForceGraphNodeData>().radius((node) => node.ring + 16).strength(0.9))
       .force("x", forceX(effectiveGraphWidth / 2).strength(0.04))
       .force("y", forceY(effectiveGraphHeight / 2).strength(0.04));
 
@@ -487,7 +637,7 @@ export default function RagViewerModal(props: Props) {
     return () => {
       simulation.stop();
     };
-  }, [effectiveGraphHeight, effectiveGraphWidth, forceGraph.links, forceGraph.nodes, viewMode]);
+  }, [effectiveGraphHeight, effectiveGraphWidth, forceGraph.links, forceGraph.nodes, forceStrength, viewMode]);
 
   useEffect(() => {
     if (!graphSearch.trim()) return;
@@ -546,6 +696,28 @@ export default function RagViewerModal(props: Props) {
   function resolveNodePosition(value: string | ForceGraphNodeData) {
     if (typeof value === "string") return graphLayout.nodes.find((node) => node.id === value) ?? null;
     return value;
+  }
+
+  function selectGraphNode(node: ForceGraphNodeData) {
+    setSelectedGraphNodeId(node.id);
+    setSelectedNode(node.meta);
+    if (node.id.startsWith("document:")) {
+      const documentId = String(node.meta.documentId ?? "");
+      setSelectedDocumentId(documentId);
+      setSelectedDocumentDraft({
+        title: String(node.meta.title ?? ""),
+        scope: String(node.meta.scope ?? ""),
+        source: String(node.meta.source ?? ""),
+        tags: Array.isArray(node.meta.tags) ? node.meta.tags.map((x) => String(x)).join(", ") : "",
+        content: String(node.meta.content ?? ""),
+      });
+      return;
+    }
+
+    if (selectedDocumentId) {
+      setSelectedDocumentId("");
+      setSelectedDocumentDraft(null);
+    }
   }
 
   return (
@@ -834,9 +1006,16 @@ export default function RagViewerModal(props: Props) {
           {props.loading ? (
             <div className="h-full flex items-center justify-center text-sm text-zinc-500">Loading...</div>
           ) : viewMode === "graph" ? (
-              <div className="relative h-full w-full bg-[var(--ui-graph-bg)]">
-                <div className="absolute z-10 m-3 rounded border border-white/10 bg-black/45 p-2 text-[11px] text-zinc-200 shadow-sm backdrop-blur">
-                  <div className="font-medium text-white">Graph Filters</div>
+              <div
+                className="relative h-full w-full overflow-hidden"
+                style={{
+                  background:
+                    "radial-gradient(circle at 20% 20%, rgba(219,234,254,0.7), transparent 28%), radial-gradient(circle at 80% 18%, rgba(191,219,254,0.45), transparent 24%), linear-gradient(180deg, #ffffff 0%, #f8fafc 48%, #eff6ff 100%)",
+                }}
+              >
+                <div className="absolute inset-0 opacity-40" style={{ backgroundImage: "linear-gradient(rgba(148,163,184,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.08) 1px, transparent 1px)", backgroundSize: "32px 32px" }} />
+                <div className="absolute top-3 left-3 z-10 w-[220px] rounded-2xl border border-slate-200/80 bg-white/88 p-3 text-[11px] text-slate-600 shadow-lg backdrop-blur">
+                  <div className="font-medium text-slate-900">Graph Filters</div>
                   <div className="mt-2 flex flex-wrap gap-2">
                     {([
                       ["hierarchy", "Hierarchy"],
@@ -844,7 +1023,7 @@ export default function RagViewerModal(props: Props) {
                       ["source", "Source"],
                       ["similar", "Similar"],
                     ] as Array<[ForceGraphLinkData["relationType"], string]>).map(([key, label]) => (
-                      <label key={key} className="flex items-center gap-1">
+                      <label key={key} className="flex items-center gap-1 text-slate-600">
                         <input
                           type="checkbox"
                           checked={relationFilters[key]}
@@ -854,7 +1033,7 @@ export default function RagViewerModal(props: Props) {
                       </label>
                     ))}
                   </div>
-                  <div className="mt-2 space-y-1">
+                  <div className="mt-3 space-y-1">
                     <div><span className={`mr-1 inline-block h-2 w-2 rounded-full ${ragGraphTheme.legend.scope}`} /> scope</div>
                     <div><span className={`mr-1 inline-block h-2 w-2 rounded-full ${ragGraphTheme.legend.document}`} /> document</div>
                     <div><span className={`mr-1 inline-block h-2 w-2 rounded-full ${ragGraphTheme.legend.chunk}`} /> chunk</div>
@@ -863,6 +1042,53 @@ export default function RagViewerModal(props: Props) {
                     <div><span className={`mr-1 inline-block h-[2px] w-4 align-middle ${ragGraphTheme.legend.similar}`} /> similar content</div>
                   </div>
                 </div>
+                <div className="absolute bottom-4 left-4 z-10 w-[220px] rounded-2xl border border-slate-200/80 bg-white/88 p-3 shadow-lg backdrop-blur">
+                  <div className="text-[11px] text-slate-500">RAG Graph</div>
+                  <div className="text-sm font-semibold text-slate-900">
+                    {forceGraph.nodes.length} nodes · {forceGraph.links.length} edges
+                  </div>
+                  <div className="mt-3 border-t border-slate-200 pt-3">
+                    <div className="mb-1 flex items-center justify-between text-[11px] text-slate-500">
+                      <span>Node repulsion</span>
+                      <span className="font-medium text-slate-700">{forceStrength}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="80"
+                      max="340"
+                      value={forceStrength}
+                      onChange={(e) => setForceStrength(Number(e.target.value))}
+                      className="w-full accent-blue-500"
+                    />
+                    <div className="mt-1 flex justify-between text-[10px] text-slate-400">
+                      <span>compact</span>
+                      <span>spread</span>
+                    </div>
+                  </div>
+                </div>
+                {hoveredGraphNodeId ? (
+                  (() => {
+                    const hovered = graphLayout.nodes.find((node) => node.id === hoveredGraphNodeId);
+                    if (!hovered) return null;
+                    return (
+                      <div className="absolute top-3 right-3 z-10 max-w-[260px] rounded-2xl border border-slate-200/80 bg-white/92 p-3 shadow-lg backdrop-blur">
+                        <div className="text-sm font-semibold text-slate-900">{truncateLabel(hovered.name, 42)}</div>
+                        <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
+                          <span
+                            className="rounded-full px-2 py-0.5 font-medium"
+                            style={{ backgroundColor: `${hovered.color}20`, color: hovered.color }}
+                          >
+                            {pickNodeTypeLabel(hovered.type)}
+                          </span>
+                          <span>{hovered.id}</span>
+                        </div>
+                        <div className="mt-2 text-[11px] text-slate-400">
+                          {hovered.type === "document" ? "Click to inspect and edit this document." : "Click to inspect metadata."}
+                        </div>
+                      </div>
+                    );
+                  })()
+                ) : null}
                 <svg width={effectiveGraphWidth} height={effectiveGraphHeight} className="block h-full w-full">
                   <defs>
                     <radialGradient id="graphGlow" cx="50%" cy="50%" r="75%">
@@ -886,6 +1112,8 @@ export default function RagViewerModal(props: Props) {
                           y2={target.y ?? 0}
                           stroke={link.color.replace(/[\d.]+\)$/u, `${link.opacity})`)}
                           strokeWidth={link.width}
+                          strokeDasharray={link.relationType === "hierarchy" ? undefined : link.relationType === "similar" ? "5 6" : "3 5"}
+                          strokeLinecap="round"
                         />
                       );
                     })}
@@ -893,31 +1121,64 @@ export default function RagViewerModal(props: Props) {
                       const isSelected = node.id === selectedGraphNodeId;
                       const isHovered = node.id === hoveredGraphNodeId;
                       const isNeighbor = forceGraph.neighborIds.has(node.id);
-                      const showLabel = isSelected || isHovered || (selectedGraphNodeId !== null && isNeighbor);
+                      const showLabel = isSelected || isHovered || node.type !== "chunk" || (selectedGraphNodeId !== null && isNeighbor);
+                      const outerRadius = isSelected ? node.ring + 3 : isHovered ? node.ring + 1.5 : node.ring;
+                      const coreRadius = isSelected ? node.inner + 1 : node.inner;
                       return (
                         <g
                           key={node.id}
                           transform={`translate(${node.x ?? 0}, ${node.y ?? 0})`}
-                          className="cursor-default"
+                          className="cursor-pointer"
                           onMouseEnter={() => setHoveredGraphNodeId(node.id)}
                           onMouseLeave={() => setHoveredGraphNodeId((current) => (current === node.id ? null : current))}
+                          onClick={() => selectGraphNode(node)}
                         >
                           <circle
-                            r={isSelected ? node.val + 2 : node.val}
-                            fill={node.color}
+                            r={outerRadius}
+                            fill={`${node.color}${node.type === "scope" ? "26" : "20"}`}
                             fillOpacity={node.opacity}
-                            stroke={isSelected ? "#f8fafc" : isHovered || (selectedGraphNodeId && isNeighbor) ? "#cbd5e1" : "transparent"}
-                            strokeWidth={isSelected ? 1.6 : isHovered || (selectedGraphNodeId && isNeighbor) ? 0.9 : 0}
+                            stroke={node.color}
+                            strokeWidth={isSelected ? 3 : 2}
                           />
+                          {(isSelected || isHovered) && (
+                            <circle
+                              r={outerRadius + 5}
+                              fill="none"
+                              stroke={`${node.color}35`}
+                              strokeWidth={2}
+                            />
+                          )}
                           <text
-                            y={node.val + 10}
+                            y={-outerRadius - 8}
                             textAnchor="middle"
                             fontSize={showLabel ? 11 : 9}
-                            fontWeight={showLabel ? 500 : 400}
-                            fill="#e5eefc"
-                            opacity={showLabel ? Math.max(node.opacity, 0.9) : node.opacity * 0.28}
+                            fontWeight={isSelected ? 600 : showLabel ? 500 : 400}
+                            fill="#334155"
+                            opacity={showLabel ? Math.max(node.opacity, 0.96) : node.opacity * 0.2}
                           >
-                            {node.name}
+                            {truncateLabel(node.name)}
+                          </text>
+                          <circle
+                            r={isSelected ? node.val + 1.5 : node.val}
+                            fill="white"
+                            fillOpacity={Math.max(node.opacity * 0.95, 0.28)}
+                            stroke="rgba(255,255,255,0.9)"
+                            strokeWidth={1}
+                          />
+                          <circle
+                            r={coreRadius}
+                            fill={node.color}
+                            fillOpacity={Math.max(node.opacity, 0.3)}
+                          />
+                          <text
+                            y={outerRadius + 14}
+                            textAnchor="middle"
+                            fontSize={10}
+                            fontWeight={500}
+                            fill="#64748b"
+                            opacity={showLabel ? Math.max(node.opacity, 0.9) : 0}
+                          >
+                            {pickNodeTypeLabel(node.type)}
                           </text>
                         </g>
                       );
@@ -926,10 +1187,59 @@ export default function RagViewerModal(props: Props) {
                 </svg>
               </div>
           ) : (
-            <ReactFlow nodes={flow.nodes} edges={flow.edges} fitView>
-              <Controls />
-              <Background />
-            </ReactFlow>
+            <div className="relative h-full w-full bg-[#f7f9fc]">
+              <div className="absolute left-3 top-3 z-10 w-[220px] rounded-2xl border border-slate-200/80 bg-white/92 p-3 text-[11px] text-slate-600 shadow-lg backdrop-blur">
+                <div className="font-medium text-slate-900">Flow Editor</div>
+                <div className="mt-1 text-slate-500">Flowise-style node canvas over the current RAG hierarchy.</div>
+                <div className="mt-3 space-y-1">
+                  <div><span className="mr-1 inline-block h-2 w-2 rounded-full bg-[#ff6b6b]" /> scope source</div>
+                  <div><span className="mr-1 inline-block h-2 w-2 rounded-full bg-[#4ecdc4]" /> document card</div>
+                  <div><span className="mr-1 inline-block h-2 w-2 rounded-full bg-[#3b82f6]" /> chunk segment</div>
+                </div>
+              </div>
+              <div className="absolute bottom-3 left-3 z-10 rounded-2xl border border-slate-200/80 bg-white/92 px-3 py-2 text-[11px] text-slate-500 shadow-lg backdrop-blur">
+                {flow.nodes.length} nodes · {flow.edges.length} connections
+              </div>
+              <ReactFlow
+                nodes={flow.nodes}
+                edges={flow.edges}
+                nodeTypes={flowNodeTypes}
+                edgeTypes={{ flowEditorEdge: FlowEditorEdge }}
+                fitView
+                minZoom={0.35}
+                maxZoom={1.7}
+                nodesDraggable={false}
+                elementsSelectable
+                onNodeClick={(_, node) => {
+                  setSelectedGraphNodeId(node.id);
+                  setSelectedNode(node.data.meta);
+                  if (node.id.startsWith("document:")) {
+                    const documentId = String(node.data.meta.documentId ?? "");
+                    setSelectedDocumentId(documentId);
+                    setSelectedDocumentDraft({
+                      title: String(node.data.meta.title ?? ""),
+                      scope: String(node.data.meta.scope ?? ""),
+                      source: String(node.data.meta.source ?? ""),
+                      tags: Array.isArray(node.data.meta.tags) ? node.data.meta.tags.map((x) => String(x)).join(", ") : "",
+                      content: String(node.data.meta.content ?? ""),
+                    });
+                  } else {
+                    setSelectedDocumentId("");
+                    setSelectedDocumentDraft(null);
+                  }
+                }}
+              >
+                <MiniMap
+                  pannable
+                  zoomable
+                  nodeColor={(node) => String((node.data as FlowEditorNodeData | undefined)?.accent ?? "#94a3b8")}
+                  maskColor="rgba(148,163,184,0.14)"
+                  style={{ backgroundColor: "#ffffff", border: "1px solid #cbd5e1", borderRadius: 14 }}
+                />
+                <Controls style={{ backgroundColor: "#ffffff", border: "1px solid #cbd5e1", borderRadius: 14 }} />
+                <Background gap={20} size={1.2} color="#dbe3ef" />
+              </ReactFlow>
+            </div>
           )}
         </section>
 
